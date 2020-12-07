@@ -1,5 +1,8 @@
 # Changelog
 
+## v0.2.9
+- Pyflow no longer requires updates to use future versions of python.
+
 ## v0.2.8
 - Fixed some warnings, and check status codes of every subprocess
 - `pyflow init` now prompts for the Python version to use

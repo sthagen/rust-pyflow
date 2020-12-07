@@ -11,6 +11,10 @@ use std::{fmt, fs, io, path::Path, path::PathBuf};
 /// Only versions we've built and hosted
 #[derive(Clone, Copy, Debug)]
 enum PyVers {
+    V3_12_0, // unreleased
+    V3_11_0, // unreleased
+    V3_10_0, // unreleased
+    V3_9_0,  // either Os
     V3_8_0,  // either Os
     V3_7_4,  // Either Os
     V3_6_9,  // Linux
@@ -79,6 +83,34 @@ impl From<(Version, Os)> for PyVers {
                     unreachable!()
                 }
             },
+            9 => match v_o.1 {
+                Os::Windows | Os::Ubuntu | Os::Centos => Self::V3_9_0,
+                _ => {
+                    abort_helper("3.9", "Mac");
+                    unreachable!()
+                }
+            },
+            10 => match v_o.1 {
+                Os::Windows | Os::Ubuntu | Os::Centos => Self::V3_10_0,
+                _ => {
+                    abort_helper("3.10", "Mac");
+                    unreachable!()
+                }
+            },
+            11 => match v_o.1 {
+                Os::Windows | Os::Ubuntu | Os::Centos => Self::V3_11_0,
+                _ => {
+                    abort_helper("3.11", "Mac");
+                    unreachable!()
+                }
+            },
+            12 => match v_o.1 {
+                Os::Windows | Os::Ubuntu | Os::Centos => Self::V3_12_0,
+                _ => {
+                    abort_helper("3.12", "Mac");
+                    unreachable!()
+                }
+            },
             _ => {
                 util::abort(unsupported);
                 unreachable!()
@@ -90,6 +122,10 @@ impl From<(Version, Os)> for PyVers {
 impl ToString for PyVers {
     fn to_string(&self) -> String {
         match self {
+            Self::V3_12_0 => "3.12.0".into(),
+            Self::V3_11_0 => "3.11.0".into(),
+            Self::V3_10_0 => "3.10.0".into(),
+            Self::V3_9_0 => "3.9.0".into(),
             Self::V3_8_0 => "3.8.0".into(),
             Self::V3_7_4 => "3.7.4".into(),
             Self::V3_6_9 => "3.6.9".into(),
@@ -104,6 +140,10 @@ impl ToString for PyVers {
 impl PyVers {
     fn to_vers(self) -> Version {
         match self {
+            Self::V3_12_0 => Version::new(3, 12, 0),
+            Self::V3_11_0 => Version::new(3, 11, 0),
+            Self::V3_10_0 => Version::new(3, 10, 0),
+            Self::V3_9_0 => Version::new(3, 9, 0),
             Self::V3_8_0 => Version::new(3, 8, 0),
             Self::V3_7_4 => Version::new(3, 7, 4),
             Self::V3_6_9 => Version::new(3, 6, 9),
@@ -256,6 +296,15 @@ impl fmt::Display for AliasError {
 /// installations.
 pub fn find_py_aliases(version: &Version) -> Vec<(String, Version)> {
     let possible_aliases = &[
+        "python3.19",
+        "python3.18",
+        "python3.17",
+        "python3.16",
+        "python3.15",
+        "python3.14",
+        "python3.13",
+        "python3.12",
+        "python3.11",
         "python3.10",
         "python3.9",
         "python3.8",
@@ -409,6 +458,10 @@ pub fn create_venv(
         #[cfg(target_os = "linux")]
         {
             match py_ver.unwrap().minor {
+                12 => py_name += ".12",
+                11 => py_name += ".11",
+                10 => py_name += ".10",
+                9 => py_name += ".9",
                 8 => py_name += ".8",
                 7 => py_name += ".7",
                 6 => py_name += ".6",
