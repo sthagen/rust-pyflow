@@ -1,15 +1,19 @@
+#[mockall_double::double]
+use crate::dep_resolution::res;
+
+use crate::dep_resolution::WarehouseRelease;
+use crate::dep_types::Extras;
 use crate::{
-    dep_resolution::{self, WarehouseRelease},
+    commands,
     dep_types::{Constraint, DependencyError, Req, ReqType, Version},
     files,
     install::{self, PackageType},
-    py_versions,
+    py_versions, CliConfig,
 };
-use crossterm::{Color, Colored};
 use ini::Ini;
 use regex::Regex;
 use serde::Deserialize;
-use std::io::{self, BufRead, BufReader, Read};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::str::FromStr;
 use std::{
     collections::HashMap,
@@ -18,6 +22,7 @@ use std::{
     process, thread, time,
 };
 use tar::Archive;
+use termcolor::{Color, ColorSpec, StandardStream, WriteColor};
 use xz2::read::XzDecoder;
 
 #[derive(Debug)]
@@ -58,55 +63,60 @@ impl FromStr for Os {
     type Err = DependencyError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let re_linux32 = Regex::new(r"(many)?linux.*i686").unwrap();
+        let re_linux = Regex::new(r"((many)?linux.*|cygwin|(open)?bsd6*)").unwrap();
+        let re_win = Regex::new(r"^win(dows|_amd64)?").unwrap();
+        let re_mac = Regex::new(r"(macosx.*|darwin|.*mac.*)").unwrap();
+
         Ok(match s {
-            "manylinux1_i686" | "manylinux2010_i686" | "manylinux2014_i686" => Self::Linux32,
-            "cygwin"
-            | "linux"
-            | "linux2"
-            | "manylinux1_x86_64"
-            | "manylinux2010_x86_64"
-            | "manylinux2014_aarch64"
-            | "manylinux2014_ppc64le"
-            | "manylinux2014_x86_64" => Self::Linux,
+            x if re_linux32.is_match(x) => Self::Linux32,
+            x if re_linux.is_match(x) => Self::Linux,
             "win32" => Self::Windows32,
-            "windows" | "win" | "win_amd64" => Self::Windows,
-            "macosx_10_6_intel" | "darwin" => Self::Mac,
-            // We don't support BSD, but parsing it as Linux may be the best solution here.
-            "openbsd6" => Self::Linux,
+            x if re_win.is_match(x) => Self::Windows,
+            x if re_mac.is_match(x) => Self::Mac,
             "any" => Self::Any,
             _ => {
-                if s.contains("mac") {
-                    Self::Mac
-                } else if s.contains("bsd") {
-                    Self::Linux // see note above
-                } else {
-                    return Err(DependencyError::new(&format!("Problem parsing Os: {}", s)));
-                }
+                return Err(DependencyError::new(&format!("Problem parsing Os: {}", s)));
             }
         })
     }
 }
 
-/// Print in a color, then reset formatting.
+/// Print line in a color, then reset formatting.
 pub fn print_color(message: &str, color: Color) {
-    println!(
-        "{}{}{}",
-        Colored::Fg(color),
-        message,
-        Colored::Fg(Color::Reset)
-    );
+    if let Err(_e) = print_color_res(message, color) {
+        panic!("Error printing in color")
+    }
+}
+
+fn print_color_res(message: &str, color: Color) -> io::Result<()> {
+    let mut stdout = StandardStream::stdout(CliConfig::current().color_choice);
+    stdout.set_color(ColorSpec::new().set_fg(Some(color)))?;
+    writeln!(&mut stdout, "{}", message)?;
+    stdout.reset()?;
+    Ok(())
+}
+
+/// Print in a color, then reset formatting. (no newline)
+pub fn print_color_(message: &str, color: Color) {
+    if let Err(_e) = print_color_res_(message, color) {
+        panic!("Error printing in color")
+    }
+}
+
+fn print_color_res_(message: &str, color: Color) -> io::Result<()> {
+    let mut stdout = StandardStream::stdout(CliConfig::current().color_choice);
+    stdout.set_color(ColorSpec::new().set_fg(Some(color)))?;
+    write!(&mut stdout, "{}", message)?;
+    stdout.reset()?;
+    Ok(())
 }
 
 /// Used when the program should exit from a condition that may arise normally from program use,
 /// like incorrect info in config files, problems with dependencies, or internet connection problems.
 /// We use `expect`, `panic!` etc for problems that indicate a bug in this program.
 pub fn abort(message: &str) {
-    println!(
-        "{}{}{}",
-        Colored::Fg(Color::Red),
-        message,
-        Colored::Fg(Color::Reset)
-    );
+    print_color(message, Color::Red);
     process::exit(1)
 }
 
@@ -195,36 +205,28 @@ pub fn show_installed(lib_path: &Path, path_reqs: &[Req]) {
     let scripts = find_console_scripts(&lib_path.join("../bin"));
 
     if installed.is_empty() {
-        print_color("No packages are installed.", Color::DarkBlue);
+        print_color("No packages are installed.", Color::Blue); // Dark
     } else {
-        print_color("These packages are installed:", Color::DarkBlue);
+        print_color("These packages are installed:", Color::Blue); // Dark
         for (name, version, _tops) in installed {
-            //        print_color(&format!("{} == \"{}\"", name, version.to_string()), Color::Magenta);
-            println!(
-                "{}{}{} == {}",
-                Colored::Fg(Color::Cyan),
-                name,
-                Colored::Fg(Color::Reset),
-                version
-            );
+            print_color_(&name, Color::Cyan);
+            print_color(&format!("=={}", version.to_string_color()), Color::White);
         }
         for req in path_reqs {
-            println!(
-                "{}{}{}, at path: {}",
-                Colored::Fg(Color::Cyan),
-                req.name,
-                Colored::Fg(Color::Reset),
-                req.path.as_ref().unwrap(),
+            print_color_(&req.name, Color::Cyan);
+            print_color(
+                &format!(", at path: {}", req.path.as_ref().unwrap()),
+                Color::White,
             );
         }
     }
 
     if scripts.is_empty() {
-        print_color("\nNo console scripts are installed.", Color::DarkBlue);
+        print_color("\nNo console scripts are installed.", Color::Blue); // Dark
     } else {
-        print_color("\nThese console scripts are installed:", Color::DarkBlue);
+        print_color("\nThese console scripts are installed:", Color::Blue); // Dark
         for script in scripts {
-            print_color(&script, Color::DarkCyan);
+            print_color(&script, Color::Cyan); // Dark
         }
     }
 }
@@ -255,10 +257,8 @@ pub fn find_installed(lib_path: &Path) -> Vec<(String, Version, Vec<String>)> {
             let mut tops = vec![];
             match fs::File::open(top_level) {
                 Ok(f) => {
-                    for line in BufReader::new(f).lines() {
-                        if let Ok(l) = line {
-                            tops.push(l);
-                        }
+                    for line in BufReader::new(f).lines().flatten() {
+                        tops.push(line);
                     }
                 }
                 Err(_) => tops.push(folder_name.to_owned()),
@@ -277,11 +277,13 @@ pub fn find_console_scripts(bin_path: &Path) -> Vec<String> {
         return vec![];
     }
 
-    for entry in bin_path.read_dir().expect("Trouble opening bin path") {
-        if let Ok(entry) = entry {
-            if entry.file_type().unwrap().is_file() {
-                result.push(entry.file_name().to_str().unwrap().to_owned())
-            }
+    for entry in bin_path
+        .read_dir()
+        .expect("Trouble opening bin path")
+        .flatten()
+    {
+        if entry.file_type().unwrap().is_file() {
+            result.push(entry.file_name().to_str().unwrap().to_owned())
         }
     }
     result
@@ -333,7 +335,17 @@ pub fn merge_reqs(
     // version.
     for added_req in &mut added_reqs_unique {
         if added_req.constraints.is_empty() {
-            let (_, vers, _) = if let Ok(r) = dep_resolution::get_version_info(&added_req.name) {
+            let (_, vers, _) = if let Ok(r) = res::get_version_info(
+                &added_req.name,
+                Some(Req::new_with_extras(
+                    added_req.name.clone(),
+                    vec![Constraint::new_any()],
+                    Extras::new_py(Constraint::new(
+                        ReqType::Exact,
+                        cfg.py_version.clone().unwrap_or_else(Version::new_any),
+                    )),
+                )),
+            ) {
                 r
             } else {
                 abort("Problem getting latest version of the package you added. Is it spelled correctly? Is the internet OK?");
@@ -408,25 +420,27 @@ pub fn extract_zip(file: &fs::File, out_path: &Path, rename: &Option<(String, St
         let mut file = archive.by_index(i).unwrap();
         // Change name here instead of after in case we've already installed a non-renamed version.
         // (which would be overwritten by this one.)
-        let file_str2 = file.sanitized_name();
+        let file_str2 = file.enclosed_name().unwrap();
         let file_str = file_str2.to_str().expect("Problem converting path to str");
 
         let extracted_file = if !file_str.contains("dist-info") && !file_str.contains("egg-info") {
             match rename {
-                Some((old, new)) => file
-                    .sanitized_name()
-                    .to_str()
-                    .unwrap()
-                    .to_owned()
-                    .replace(old, new)
-                    .into(),
-                None => file.sanitized_name(),
+                Some((old, new)) => PathBuf::from_str(
+                    file.enclosed_name()
+                        .unwrap()
+                        .to_str()
+                        .unwrap()
+                        .to_owned()
+                        .replace(old, new)
+                        .as_str(),
+                ),
+                None => PathBuf::from_str(file.enclosed_name().unwrap().to_str().unwrap()),
             }
         } else {
-            file.sanitized_name()
+            PathBuf::from_str(file.enclosed_name().unwrap().to_str().unwrap())
         };
 
-        let outpath = out_path.join(extracted_file);
+        let outpath = out_path.join(extracted_file.unwrap());
 
         if (&*file.name()).ends_with('/') {
             fs::create_dir_all(&outpath).unwrap();
@@ -458,9 +472,12 @@ pub fn unpack_tar_xz(archive_path: &Path, dest: &Path) {
     let mut tar: Vec<u8> = Vec::new();
     let mut decompressor = XzDecoder::new(&archive_bytes[..]);
     if decompressor.read_to_end(&mut tar).is_err() {
-        abort(&format!("Problem decompressing the archive: {:?}. This may be due to a failed downoad. \
+        abort(&format!(
+            "Problem decompressing the archive: {:?}. This may be due to a failed downoad. \
         Try deleting it, then trying again. Note that Pyflow will only install officially-released \
-        Python versions. If you'd like to use a pre-release, you must install it manually.", archive_path))
+        Python versions. If you'd like to use a pre-release, you must install it manually.",
+            archive_path
+        ))
     }
 
     // We've decompressed the .xz; now unpack the tar.
@@ -484,7 +501,7 @@ pub fn find_or_create_venv(
     // The version's explicitly specified; check if an environment for that version
     let compatible_venvs: Vec<&(u32, u32)> = venvs
         .iter()
-        .filter(|(ma, mi)| cfg_vers.major == *ma && cfg_vers.minor == *mi)
+        .filter(|(ma, mi)| cfg_vers.major == Some(*ma) && cfg_vers.minor == Some(*mi))
         .collect();
 
     let vers_path;
@@ -493,8 +510,8 @@ pub fn find_or_create_venv(
         0 => {
             let vers =
                 py_versions::create_venv(cfg_vers, pypackages_dir, pyflow_dir, dep_cache_path);
-            vers_path = pypackages_dir.join(&format!("{}.{}", vers.major, vers.minor));
-            py_vers = Version::new_short(vers.major, vers.minor); // Don't include patch.
+            vers_path = pypackages_dir.join(vers.to_string_med());
+            py_vers = Version::new_opt(vers.major, vers.minor, None); // Don't include patch.
         }
         1 => {
             vers_path = pypackages_dir.join(&format!(
@@ -729,7 +746,7 @@ pub fn find_best_release(
             abort(&format!(
                 "Unable to find a compatible release for {}: {}",
                 name,
-                version.to_string()
+                version.to_string_color()
             ));
             unreachable!()
         } else {
@@ -774,11 +791,10 @@ pub fn find_first_file(path: &Path) -> PathBuf {
         for entry in path
             .read_dir()
             .expect("Trouble reading the directory when finding the first file.")
+            .flatten()
         {
-            if let Ok(entry) = entry {
-                if entry.file_type().unwrap().is_file() {
-                    return entry.path();
-                }
+            if entry.file_type().unwrap().is_file() {
+                return entry.path();
             }
         }
         abort(&format!(
@@ -830,24 +846,29 @@ pub fn parse_metadata(path: &Path) -> Metadata {
 
 pub fn find_folders(path: &Path) -> Vec<String> {
     let mut result = vec![];
-    for entry in path.read_dir().expect("Can't open lib path") {
-        if let Ok(entry) = entry {
-            if entry
-                .file_type()
-                .expect("Problem reading lib path file type")
-                .is_dir()
-            {
-                result.push(
-                    entry
-                        .file_name()
-                        .to_str()
-                        .expect("Problem converting folder name to string")
-                        .to_owned(),
-                );
-            }
+    for entry in path.read_dir().expect("Can't open lib path").flatten() {
+        if entry
+            .file_type()
+            .expect("Problem reading lib path file type")
+            .is_dir()
+        {
+            result.push(
+                entry
+                    .file_name()
+                    .to_str()
+                    .expect("Problem converting folder name to string")
+                    .to_owned(),
+            );
         }
     }
     result
+}
+
+fn default_python() -> Version {
+    match commands::find_py_version("python") {
+        Some(x) => x,
+        None => Version::new_short(3, 9),
+    }
 }
 
 /// Ask the user what Python version to use.
@@ -856,6 +877,9 @@ pub fn prompt_py_vers() -> Version {
         "Please enter the Python version for this project: (eg: 3.8)",
         Color::Magenta,
     );
+    let default_ver = default_python();
+    print!("Default [{}]:", default_ver);
+    std::io::stdout().flush().unwrap();
     let mut input = String::new();
     io::stdin()
         .read_line(&mut input)
@@ -863,8 +887,11 @@ pub fn prompt_py_vers() -> Version {
 
     input.pop(); // Remove trailing newline.
     let input = input.replace("\n", "").replace("\r", "");
-
-    fallible_v_parse(&input)
+    if !input.is_empty() {
+        fallible_v_parse(&input)
+    } else {
+        default_ver
+    }
 }
 
 /// We've removed the git repos from packages to install form pypi, but make
@@ -905,5 +932,66 @@ pub(crate) fn check_command_output_with(output: &process::Output, f: impl Fn(&st
         let stderr =
             std::str::from_utf8(&output.stderr).expect("building string from command output");
         f(&stderr)
+    }
+}
+
+/// Take the canonicalized `path` and join `extend` onto it
+pub fn canon_join(path: &Path, extend: &str) -> PathBuf {
+    let ex_path = Path::new(extend);
+    let canon = match ex_path.canonicalize() {
+        Ok(c) => c,
+        Err(e) => {
+            abort(&format!("{}\n\"{}\"", e, extend));
+            unreachable!()
+        }
+    };
+    let mut new_path = path.to_path_buf();
+
+    for comp in canon.components() {
+        new_path = match comp {
+            std::path::Component::Normal(c) => new_path.join(c),
+            _ => new_path.join(""),
+        }
+    }
+    new_path
+}
+
+#[cfg(test)]
+mod tests {
+    use rstest::rstest;
+
+    use super::*;
+    use crate::dep_types;
+
+    #[test]
+    fn dummy_test() {}
+
+    #[rstest(
+        input,
+        expected,
+        case("manylinux1_i686", Ok(Os::Linux32)),
+        case("manylinux2010_i686", Ok(Os::Linux32)),
+        case("manylinux2014_i686", Ok(Os::Linux32)),
+        case("cygwin", Ok(Os::Linux)),
+        case("linux", Ok(Os::Linux)),
+        case("linux2", Ok(Os::Linux)),
+        case("manylinux1_x86_64", Ok(Os::Linux)),
+        case("manylinux2010_x86_64", Ok(Os::Linux)),
+        case("manylinux2014_aarch64", Ok(Os::Linux)),
+        case("manylinux2014_ppc64le", Ok(Os::Linux)),
+        case("manylinux2014_x86_64", Ok(Os::Linux)),
+        case("win32", Ok(Os::Windows32)),
+        case("windows", Ok(Os::Windows)),
+        case("win", Ok(Os::Windows)),
+        case("win_amd64", Ok(Os::Windows)),
+        case("macosx_10_6_intel", Ok(Os::Mac)),
+        case("darwin", Ok(Os::Mac)),
+        case("openbsd6", Ok(Os::Linux)),
+        case("any", Ok(Os::Any)),
+        case("some other bsd name", Ok(Os::Linux)),
+        case("some other mac name", Ok(Os::Mac))
+    )]
+    fn test_os_from_str(input: &str, expected: Result<Os, dep_types::DependencyError>) {
+        assert_eq!(Os::from_str(input), expected);
     }
 }

@@ -1,8 +1,8 @@
 use crate::{dep_types::Req, util};
-use crossterm::Color;
 use regex::Regex;
-use std::collections::HashMap;
-use std::{env, fs, path::PathBuf, process::Command};
+use std::{collections::HashMap, path::Path};
+use std::{env, fs, process::Command};
+use termcolor::Color;
 
 // https://packaging.python.org/tutorials/packaging-projects/
 
@@ -217,7 +217,7 @@ pub fn build(
     };
 }
 
-pub(crate) fn publish(bin_path: &PathBuf, cfg: &crate::Config) {
+pub(crate) fn publish(bin_path: &Path, cfg: &crate::Config) {
     let repo_url = match cfg.package_url.clone() {
         Some(pu) => {
             let mut r = pu;
@@ -254,7 +254,7 @@ pub mod test {
         let cfg = crate::Config {
             name: Some("everythingkiller".into()),
             py_version: Some(Version::new_short(3, 6)),
-            version: Some(Version::new_short(0, 1)),
+            version: Some(Version::new(0, 1, 0)),
             authors: vec!["Fraa Erasmas <raz@edhar.math>".into()],
             homepage: Some("https://everything.math".into()),
             description: Some("Small, but packs a punch!".into()),

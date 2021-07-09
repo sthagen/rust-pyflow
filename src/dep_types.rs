@@ -1,13 +1,18 @@
 use crate::dep_parser::{
     parse_constraint, parse_pip_str, parse_req, parse_req_pypi_fmt, parse_version, parse_wh_py_vers,
 };
-use crate::{dep_resolution, util};
-use crossterm::{Color, Colored};
+#[mockall_double::double]
+use crate::dep_resolution::res;
+use crate::dep_resolution::WarehouseRelease;
+use crate::{util, CliConfig};
 use nom::combinator::all_consuming;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::error::Error;
+use std::hash::{Hash, Hasher};
+use std::io::Write;
 use std::{cmp, fmt, num, str::FromStr};
+use termcolor::{Buffer, BufferWriter, Color, ColorSpec, WriteColor};
 
 pub const MAX_VER: u32 = 999_999; // Represents the highest major version we can have
 
@@ -65,7 +70,7 @@ impl From<reqwest::Error> for DependencyError {
 }
 
 /// Ideally we won't deal with these much, but include for compatibility.
-#[derive(Debug, Clone, Copy, Deserialize, Eq, Hash, PartialEq)]
+#[derive(Debug, Clone, Deserialize, Eq, Hash, PartialEq)]
 pub enum VersionModifier {
     Alpha,
     Beta,
@@ -73,6 +78,7 @@ pub enum VersionModifier {
     Dep, // todo: Not sure what this is, but have found it.
     // Used to allow comparisons between versions that have and don't have modifiers.
     Null,
+    Other(String),
 }
 
 impl FromStr for VersionModifier {
@@ -84,7 +90,8 @@ impl FromStr for VersionModifier {
             "b" => Self::Beta,
             "rc" => Self::ReleaseCandidate,
             "dep" => Self::Dep,
-            _ => return Err(DependencyError::new("Problem parsing version modifier")),
+            //_ => return Err(DependencyError::new("Problem parsing version modifier")),
+            _x => Self::Other(s.to_string()),
         };
         Ok(result)
     }
@@ -98,6 +105,7 @@ impl ToString for VersionModifier {
             Self::ReleaseCandidate => "rc".into(),
             Self::Dep => "dep".into(),
             Self::Null => panic!("Can't convert Null to string; misused"),
+            Self::Other(x) => x.into(),
         }
     }
 }
@@ -105,18 +113,19 @@ impl ToString for VersionModifier {
 impl VersionModifier {
     fn orderval(self) -> u8 {
         match self {
-            Self::Null => 4,
-            Self::ReleaseCandidate => 3,
-            Self::Beta => 2,
-            Self::Alpha => 1,
-            Self::Dep => 0,
+            Self::Null => 5,
+            Self::ReleaseCandidate => 4,
+            Self::Beta => 3,
+            Self::Alpha => 2,
+            Self::Dep => 1,
+            Self::Other(_x) => 0,
         }
     }
 }
 
 impl Ord for VersionModifier {
     fn cmp(&self, other: &Self) -> cmp::Ordering {
-        self.orderval().cmp(&other.orderval())
+        self.clone().orderval().cmp(&other.clone().orderval())
     }
 }
 
@@ -127,39 +136,94 @@ impl PartialOrd for VersionModifier {
 }
 
 /// An exact, 3-number Semver version. With some possible extras.
-#[derive(Clone, Copy, Default, Deserialize, Eq, Hash, PartialEq)]
+#[derive(Clone, Default, Deserialize, Eq)]
 pub struct Version {
-    pub major: u32,
-    pub minor: u32,
-    pub patch: u32,
+    pub major: Option<u32>,
+    pub minor: Option<u32>,
+    pub patch: Option<u32>,
     pub extra_num: Option<u32>,                   // eg 4.2.3.1
     pub modifier: Option<(VersionModifier, u32)>, // eg a1
+    /// if `true` the star goes in the first `None` slot. Remaining slots should be `None`
+    pub star: bool,
 }
 
 impl Version {
     pub const fn new(major: u32, minor: u32, patch: u32) -> Self {
         Self {
-            major,
-            minor,
-            patch,
+            major: Some(major),
+            minor: Some(minor),
+            patch: Some(patch),
             extra_num: None,
             modifier: None,
+            star: false,
+        }
+    }
+
+    pub const fn new_any() -> Self {
+        Self {
+            major: None,
+            minor: None,
+            patch: None,
+            extra_num: None,
+            modifier: None,
+            star: true,
         }
     }
 
     /// No patch specified.
     pub const fn new_short(major: u32, minor: u32) -> Self {
         Self {
-            major,
-            minor,
-            patch: 0,
+            major: Some(major),
+            minor: Some(minor),
+            patch: None,
             extra_num: None,
             modifier: None,
+            star: false,
+        }
+    }
+
+    pub const fn new_opt(major: Option<u32>, minor: Option<u32>, patch: Option<u32>) -> Self {
+        Self {
+            major,
+            minor,
+            patch,
+            extra_num: None,
+            modifier: None,
+            star: false,
+        }
+    }
+
+    /// create new version with star option
+    pub const fn new_star(
+        major: Option<u32>,
+        minor: Option<u32>,
+        patch: Option<u32>,
+        star: bool,
+    ) -> Self {
+        Self {
+            major,
+            minor,
+            patch,
+            extra_num: None,
+            modifier: None,
+            star,
+        }
+    }
+
+    /// Create new Version of self with `star` set to false
+    pub fn new_unstar(&self) -> Self {
+        Self {
+            major: Some(self.major.unwrap_or(0)),
+            minor: Some(self.minor.unwrap_or(0)),
+            patch: Some(self.patch.unwrap_or(0)),
+            extra_num: self.extra_num,
+            modifier: self.modifier.clone(),
+            star: false,
         }
     }
 
     pub const fn _max() -> Self {
-        Self::new(MAX_VER, 0, 0)
+        Self::new_opt(Some(MAX_VER), None, None)
     }
 
     /// Prevents repetition.
@@ -167,34 +231,66 @@ impl Version {
         if let Some(extra_num) = self.extra_num {
             s.push_str(&format!(".{}", extra_num.to_string()));
         }
-        if let Some((modifier, num)) = self.modifier {
+        if let Some((modifier, num)) = self.modifier.clone() {
             s.push_str(&format!("{}{}", modifier.to_string(), num.to_string()));
         }
     }
 
     pub fn to_string_med(&self) -> String {
-        let mut result = format!("{}.{}", self.major, self.minor);
+        let mut result = format!("{}.{}", self.major.unwrap_or(0), self.minor.unwrap_or(0));
         self.add_str_mod(&mut result);
         result
     }
     pub fn to_string_short(&self) -> String {
-        let mut result = format!("{}", self.major);
-        self.add_str_mod(&mut result);
-        result
-    }
-
-    /// unlike Display, which overwrites to_string, don't add colors.
-    pub fn to_string2(&self) -> String {
-        let mut result = format!("{}.{}.{}", self.major, self.minor, self.patch);
+        let mut result = format!("{}", self.major.unwrap_or(0));
         self.add_str_mod(&mut result);
         result
     }
 
     /// unlike Display, which overwrites to_string, don't add colors.
     pub fn to_string_no_patch(&self) -> String {
-        let mut result = format!("{}.{}", self.major, self.minor);
+        let mut result = format!("{}.{}", self.major.unwrap_or(0), self.minor.unwrap_or(0));
         self.add_str_mod(&mut result);
         result
+    }
+
+    pub fn to_string_color(&self) -> String {
+        self.colorize().unwrap_or_else(|_| self.to_string())
+    }
+
+    fn colorize(&self) -> anyhow::Result<String> {
+        let bufwtr = BufferWriter::stdout(CliConfig::current().color_choice);
+        let mut buf: Buffer = bufwtr.buffer();
+        let num_c = Some(Color::Blue);
+        let dot_c = Some(Color::Yellow); // Dark
+
+        let mut suffix = "".to_string();
+        if let Some(num) = self.extra_num {
+            suffix.push('.');
+            suffix.push_str(&num.to_string());
+        }
+        if let Some((modifier, num)) = self.modifier.clone() {
+            suffix.push_str(&modifier.to_string());
+            suffix.push_str(&num.to_string());
+        }
+        buf.set_color(ColorSpec::new().set_fg(num_c))?;
+        write!(buf, "{}", self.major.unwrap_or(0))?;
+        if let Some(x) = self.minor {
+            buf.set_color(ColorSpec::new().set_fg(dot_c))?;
+            write!(buf, ".")?;
+            buf.set_color(ColorSpec::new().set_fg(num_c))?;
+            write!(buf, "{}", x)?;
+        }
+        if let Some(x) = self.patch {
+            buf.set_color(ColorSpec::new().set_fg(dot_c))?;
+            write!(buf, ".")?;
+            buf.set_color(ColorSpec::new().set_fg(num_c))?;
+            write!(buf, "{}", x)?;
+        }
+        write!(buf, "{}", suffix)?;
+        buf.reset()?;
+
+        Ok(String::from_utf8_lossy(buf.as_slice()).to_string())
     }
 }
 
@@ -211,23 +307,44 @@ impl FromStr for Version {
 impl Ord for Version {
     fn cmp(&self, other: &Self) -> cmp::Ordering {
         // None version modifiers should rank highest. Ie 17.0 > 17.0rc1
-        let self_mod = self.modifier.unwrap_or((VersionModifier::Null, 0));
-        let other_mod = other.modifier.unwrap_or((VersionModifier::Null, 0));
-
-        if self.major != other.major {
-            self.major.cmp(&other.major)
-        } else if self.minor != other.minor {
-            self.minor.cmp(&other.minor)
-        } else if self.patch != other.patch {
-            self.patch.cmp(&other.patch)
-        } else if self.extra_num != other.extra_num {
-            self.extra_num
-                .unwrap_or(0)
-                .cmp(&other.extra_num.unwrap_or(0))
-        } else if self_mod.0 == other_mod.0 {
-            self_mod.1.cmp(&other_mod.1)
+        let self_mod = self.modifier.clone().unwrap_or((VersionModifier::Null, 0));
+        let other_mod = other.modifier.clone().unwrap_or((VersionModifier::Null, 0));
+        // Mirror the set field if we have a star present
+        let cmp_star = |obj: Option<u32>, oth: Option<u32>, star: bool| -> cmp::Ordering {
+            let none_val = if star {
+                if obj.is_none() && oth.is_none() {
+                    0
+                } else if let Some(x) = obj {
+                    x
+                } else {
+                    oth.unwrap_or(0)
+                }
+            } else {
+                0
+            };
+            obj.unwrap_or(none_val).cmp(&oth.unwrap_or(none_val))
+        };
+        let star = self.star || other.star;
+        let maj = cmp_star(self.major, other.major, star);
+        let min = cmp_star(self.minor, other.minor, star);
+        let pat = cmp_star(self.patch, other.patch, star);
+        let ext = cmp_star(self.extra_num, other.extra_num, star);
+        if !matches!(maj, cmp::Ordering::Equal) {
+            maj
+        } else if !matches!(min, cmp::Ordering::Equal) {
+            min
+        } else if !matches!(pat, cmp::Ordering::Equal) {
+            pat
+        } else if !matches!(ext, cmp::Ordering::Equal) {
+            ext
+        } else if !star {
+            if self_mod.0 == other_mod.0 {
+                self_mod.1.cmp(&other_mod.1)
+            } else {
+                self_mod.0.cmp(&other_mod.0)
+            }
         } else {
-            self_mod.0.cmp(&other_mod.0)
+            cmp::Ordering::Equal
         }
     }
 }
@@ -235,6 +352,26 @@ impl Ord for Version {
 impl PartialOrd for Version {
     fn partial_cmp(&self, other: &Self) -> Option<cmp::Ordering> {
         Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for Version {
+    fn eq(&self, other: &Self) -> bool {
+        matches!(self.cmp(other), cmp::Ordering::Equal)
+    }
+}
+
+impl Hash for Version {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.major.hash(state);
+        self.minor.unwrap_or(0).hash(state);
+        self.patch.unwrap_or(0).hash(state);
+        self.extra_num.unwrap_or(0).hash(state);
+        self.modifier
+            .clone()
+            .unwrap_or((VersionModifier::Null, 0))
+            .hash(state);
+        self.star.hash(state);
     }
 }
 
@@ -246,24 +383,35 @@ impl PartialOrd for Version {
 
 impl fmt::Display for Version {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let num_c = Colored::Fg(Color::Blue);
-        let dot_c = Colored::Fg(Color::DarkYellow);
-        let r = Colored::Fg(Color::Reset);
-
-        let mut suffix = "".to_string();
-        if let Some(num) = self.extra_num {
-            suffix.push('.');
-            suffix.push_str(&num.to_string());
+        let mut version = if let Some(x) = self.major {
+            x.to_string()
+        } else {
+            "*".to_string()
+        };
+        if self.major.is_some() {
+            let mut star_handled = false;
+            let parts = vec![self.minor, self.patch, self.extra_num];
+            for part in parts.iter() {
+                if let Some(p) = part {
+                    version.push('.');
+                    version.push_str(&p.to_string());
+                } else if self.star && !star_handled {
+                    version.push_str(".*");
+                    star_handled = true;
+                    break;
+                }
+            }
+            if !self.star || !star_handled {
+                if let Some((modifier, num)) = self.modifier.clone() {
+                    version.push_str(&modifier.to_string());
+                    version.push_str(&num.to_string());
+                }
+            }
+            if self.star && !star_handled {
+                version.push('*');
+            }
         }
-        if let Some((modifier, num)) = self.modifier {
-            suffix.push_str(&modifier.to_string());
-            suffix.push_str(&num.to_string());
-        }
-        write!(
-            f,
-            "{}{}{}.{}{}{}.{}{}{}{}",
-            num_c, self.major, dot_c, num_c, self.minor, dot_c, num_c, self.patch, suffix, r
-        )
+        write!(f, "{}", version)
     }
 }
 
@@ -284,7 +432,8 @@ pub enum ReqType {
     Lt,
     Caret,
     Tilde,
-    // todo wildcard
+    TildeEq, // PEP440 ~= is different from ~
+             // todo wildcard
 }
 
 impl ToString for ReqType {
@@ -299,6 +448,7 @@ impl ToString for ReqType {
             Self::Ne => "!=".into(),
             Self::Caret => "^".into(),
             Self::Tilde => "~".into(),
+            Self::TildeEq => "~=".into(),
         }
     }
 }
@@ -316,7 +466,7 @@ impl FromStr for ReqType {
             "!=" => Ok(Self::Ne),
             "^" => Ok(Self::Caret),
             "~" => Ok(Self::Tilde),
-            "~=" => Ok(Self::Tilde),
+            "~=" => Ok(Self::TildeEq),
             _ => Err(DependencyError::new("Problem parsing ReqType")),
         }
     }
@@ -346,10 +496,22 @@ impl Constraint {
         Self { type_, version }
     }
 
+    pub const fn new_any() -> Self {
+        Self {
+            type_: ReqType::Exact,
+            version: Version::new_any(),
+        }
+    }
+
     /// From a comma-separated list
     pub fn from_str_multiple(vers: &str) -> Result<Vec<Self>, DependencyError> {
         let mut result = vec![];
         let vers = vers.replace(" ", "");
+        let vers = if vers.is_empty() {
+            ">=2.0".to_string()
+        } else {
+            vers
+        };
 
         for req in vers.split(',') {
             match Self::from_str(req) {
@@ -393,14 +555,14 @@ impl Constraint {
     /// Find the lowest and highest compatible versions. Return a vec, since the != requirement type
     /// has two ranges.
     pub fn compatible_range(&self) -> Vec<(Version, Version)> {
-        let highest = Version::new(MAX_VER, 0, 0);
+        let highest = Version::_max();
         let lowest = Version::new(0, 0, 0);
         let max;
 
-        let safely_subtract = |major: u32, minor: u32, patch: u32| {
-            let mut major = major;
-            let mut minor = minor;
-            let mut patch = patch;
+        let safely_subtract = |major: Option<u32>, minor: Option<u32>, patch: Option<u32>| {
+            let mut major = major.unwrap_or(0);
+            let mut minor = minor.unwrap_or(0);
+            let mut patch = patch.unwrap_or(0);
             // Don't try to make a negative version component.
             // ie 0.0.0. Return max of 0.0.0
             if major == 0 && minor == 0 && patch == 0 {
@@ -422,14 +584,14 @@ impl Constraint {
 
         // Note that other than for not-equals, the the resulting Vec has len 1.
         match self.type_ {
-            ReqType::Exact => vec![(self.version, self.version)],
-            ReqType::Gte => vec![(self.version, highest)],
-            ReqType::Lte => vec![(lowest, self.version)],
+            ReqType::Exact => vec![(self.version.new_unstar(), self.get_max_version())],
+            ReqType::Gte => vec![(self.version.new_unstar(), highest)],
+            ReqType::Lte => vec![(lowest, self.version.new_unstar())],
             ReqType::Gt => vec![(
                 Version::new(
-                    self.version.major,
-                    self.version.minor,
-                    self.version.patch + 1,
+                    self.version.major.unwrap_or(0),
+                    self.version.minor.unwrap_or(0),
+                    self.version.patch.unwrap_or(0) + 1,
                 ),
                 highest,
             )],
@@ -445,74 +607,138 @@ impl Constraint {
                     (lowest, Version::new(major, minor, patch)),
                     (
                         Version::new(
-                            self.version.major,
-                            self.version.minor,
-                            self.version.patch + 1,
+                            self.version.major.unwrap_or(0),
+                            self.version.minor.unwrap_or(0),
+                            self.version.patch.unwrap_or(0) + 1,
                         ),
                         highest,
                     ),
                 ]
             }
-            // This section DRY from `compatible`.
             ReqType::Caret => {
-                if self.version.major > 0 {
-                    max = Version::new(self.version.major + 1, 0, 0);
-                } else if self.version.minor > 0 {
-                    max = Version::new(0, self.version.minor + 1, 0);
-                } else {
-                    max = Version::new(0, 0, self.version.patch + 2);
-                }
+                max = self.get_max_version();
                 // We need to use Lt logic for ^ and ~.
                 let (major, minor, patch) = safely_subtract(max.major, max.minor, max.patch);
-                vec![(self.version, Version::new(major, minor, patch))]
+                vec![(self.version.clone(), Version::new(major, minor, patch))]
             }
-            // For tilde, if minor's specified, can only increment patch.
-            // If not, can increment minor or patch.
             ReqType::Tilde => {
-                if self.version.minor > 0 {
-                    max = Version::new(self.version.major, self.version.minor + 1, 0);
-                } else {
-                    max = Version::new(self.version.major + 1, 0, 0);
-                }
+                max = self.get_max_version();
                 let (major, minor, patch) = safely_subtract(max.major, max.minor, max.patch);
-                vec![(self.version, Version::new(major, minor, patch))]
+                vec![(self.version.clone(), Version::new(major, minor, patch))]
+            }
+            ReqType::TildeEq => {
+                max = self.get_max_version();
+                let (major, minor, patch) = safely_subtract(max.major, max.minor, max.patch);
+                vec![(self.version.clone(), Version::new(major, minor, patch))]
             }
         }
     }
 
     pub fn is_compatible(&self, version: &Version) -> bool {
-        let min = self.version;
+        let min = self.version.clone();
         let max;
 
         match self.type_ {
-            ReqType::Exact => self.version == *version,
+            ReqType::Exact => {
+                if !self.version.star && !version.star {
+                    self.version == *version
+                } else {
+                    max = self.get_max_version();
+                    min <= *version && *version <= max
+                }
+            }
             ReqType::Gte => self.version <= *version,
             ReqType::Lte => self.version >= *version,
             ReqType::Gt => self.version < *version,
             ReqType::Lt => self.version > *version,
             ReqType::Ne => self.version != *version,
             ReqType::Caret => {
-                if self.version.major > 0 {
-                    max = Version::new(self.version.major + 1, 0, 0);
-                } else if self.version.minor > 0 {
-                    max = Version::new(0, self.version.minor + 1, 0);
-                } else {
-                    max = Version::new(0, 0, self.version.patch + 2);
-                }
-
+                max = self.get_max_version();
                 min <= *version && *version < max
             }
             // For tilde, if minor's specified, can only increment patch.
             // If not, can increment minor or patch.
             ReqType::Tilde => {
-                if self.version.minor > 0 {
-                    max = Version::new(self.version.major, self.version.minor + 1, 0);
-                } else {
-                    max = Version::new(self.version.major + 1, 0, 0);
-                }
-
+                max = self.get_max_version();
                 min <= *version && *version < max
             }
+
+            ReqType::TildeEq => {
+                max = self.get_max_version();
+                min <= *version && *version < max
+            }
+        }
+    }
+
+    /// This internal function is to DRY Caret and Tilde max versions
+    fn get_max_version(&self) -> Version {
+        match self.type_ {
+            ReqType::Exact => {
+                if self.version.star {
+                    if self.version.major.is_none() {
+                        Version::new_star(Some(MAX_VER), Some(MAX_VER), Some(MAX_VER), true)
+                    } else if self.version.minor.is_none() {
+                        Version::new_star(self.version.major, Some(MAX_VER), Some(MAX_VER), true)
+                    } else if self.version.patch.is_none() {
+                        Version::new_star(
+                            self.version.major,
+                            self.version.minor,
+                            Some(MAX_VER),
+                            true,
+                        )
+                    } else {
+                        self.version.clone()
+                    }
+                } else {
+                    self.version.clone()
+                }
+            }
+            ReqType::Caret => {
+                if self.version.major.unwrap_or(0) > 0 {
+                    Version::new(self.version.major.unwrap_or(0) + 1, 0, 0)
+                } else if self.version.minor > Some(0) {
+                    Version::new(0, self.version.minor.unwrap() + 1, 0)
+                } else {
+                    Version::new(0, 0, self.version.patch.unwrap_or(0) + 1)
+                }
+            }
+            // For tilde, if minor's specified, can only increment patch.
+            // If not, can increment minor or patch.
+            ReqType::Tilde => {
+                if let Some(x) = self.version.minor {
+                    Version::new(self.version.major.unwrap_or(0), x + 1, 0)
+                } else {
+                    Version::new(self.version.major.unwrap_or(0) + 1, 0, 0)
+                }
+            }
+            /*
+            https://www.python.org/dev/peps/pep-0440/#compatible-release
+            This operator MUST NOT be used with a single segment version number such as ~=1.
+            For example, the following groups of version clauses are equivalent:
+
+            ~= 2.2
+            >= 2.2, == 2.*
+
+            ~= 1.4.5
+            >= 1.4.5, == 1.4.*
+
+             */
+            ReqType::TildeEq => {
+                if self.version.patch.is_some() {
+                    Version::new(
+                        self.version.major.unwrap_or(0),
+                        self.version.minor.unwrap_or(0) + 1,
+                        0,
+                    )
+                } else if self.version.minor.is_some() {
+                    Version::new(self.version.major.unwrap_or(0) + 1, 0, 0)
+                } else {
+                    panic!("Invalid `~=` constraint for {:?}", self.version);
+                }
+            }
+            // Not sure we would ever actually use this with other types. So
+            // just return a clone
+            _ => self.version.clone(),
         }
     }
 }
@@ -539,9 +765,9 @@ pub fn intersection_many(constrs: &[Constraint]) -> Vec<(Version, Version)> {
         if let ReqType::Ne = constr.type_ {
             rng2 = (Version::new(0, 0, 0), Version::_max());
             // We'll remove nes at the end.
-            nes.push(constr.version);
+            nes.push(constr.version.clone());
         } else {
-            rng2 = rng[0]; // If not Ne, there will be exactly 1.
+            rng2 = rng[0].clone(); // If not Ne, there will be exactly 1.
         }
         ranges.push(rng2);
     }
@@ -555,7 +781,7 @@ fn intersection_many2(reqs: &[(Version, Version)]) -> Vec<(Version, Version)> {
     // todo: Broken for notequals, which involves joining two ranges with OR logic.
     let init = vec![(Version::new(0, 0, 0), Version::new(MAX_VER, 0, 0))];
     reqs.iter().fold(init, |acc, constraint_set| {
-        intersection(&[*constraint_set], &acc)
+        intersection(&[constraint_set.clone()], &acc)
     })
 }
 
@@ -571,7 +797,10 @@ pub fn intersection(
         for rng2 in ranges2 {
             // 0 is min, 1 is max.
             if rng2.1 >= rng1.0 && rng1.1 >= rng2.0 {
-                result.push((cmp::max(rng2.0, rng1.0), cmp::min(rng1.1, rng2.1)));
+                result.push((
+                    cmp::max(rng2.0.clone(), rng1.0.clone()),
+                    cmp::min(rng1.1.clone(), rng2.1.clone()),
+                ));
             }
         }
     }
@@ -585,13 +814,23 @@ pub struct Extras {
     pub python_version: Option<Constraint>,
 }
 
+impl Extras {
+    pub const fn new_py(python_version: Constraint) -> Self {
+        Self {
+            extra: None,
+            sys_platform: None,
+            python_version: Some(python_version),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 pub struct Req {
     pub name: String,
     pub constraints: Vec<Constraint>,
     pub extra: Option<String>,
     pub sys_platform: Option<(ReqType, util::Os)>,
-    pub python_version: Option<Constraint>,
+    pub python_version: Option<Vec<Constraint>>,
     pub install_with_extras: Option<Vec<String>>,
     pub path: Option<String>,
     pub git: Option<String>, // String is the git repo. // todo: Branch
@@ -617,7 +856,7 @@ impl Req {
             constraints,
             extra: extras.extra,
             sys_platform: extras.sys_platform,
-            python_version: extras.python_version,
+            python_version: extras.python_version.map(|x| vec![x]),
             install_with_extras: None,
             path: None,
             git: None,
@@ -640,13 +879,77 @@ impl Req {
         all_consuming(parse_pip_str)(s).ok().map(|x| x.1)
     }
 
+    pub fn from_warehouse_release(
+        name: String,
+        version: String,
+        release: WarehouseRelease,
+    ) -> Self {
+        let ver = Version::from_str(&version)
+            .ok()
+            .unwrap_or_else(|| Version::new_star(None, None, None, true));
+        let constraint = Constraint::new(ReqType::Exact, ver);
+        let py_ver = Constraint::from_wh_py_vers(&release.python_version);
+        let requires = if let Some(x) = release.requires_python {
+            if x.as_str() > "" {
+                if let Ok(c) = Constraint::from_str_multiple(&x) {
+                    Some(c)
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let py_req = requires.unwrap_or_else(|| py_ver.unwrap());
+
+        Self {
+            name,
+            constraints: vec![constraint],
+            extra: None,
+            sys_platform: None,
+            python_version: Some(py_req),
+            install_with_extras: None,
+            path: None,
+            git: None,
+        }
+    }
+
+    /// Clone the Req but set a python requirement if python_version.is_none()
+    pub fn clone_or_default_py(&self, python_version: &Version) -> Self {
+        Self {
+            name: self.name.clone(),
+            constraints: self.constraints.clone(),
+            extra: self.extra.clone(),
+            sys_platform: self.sys_platform,
+            python_version: if let Some(ref pv) = self.python_version {
+                Some(pv.clone())
+            } else {
+                Some(vec![Constraint::new(ReqType::Gte, python_version.clone())])
+            },
+            install_with_extras: self.install_with_extras.clone(),
+            path: self.path.clone(),
+            git: self.path.clone(),
+        }
+    }
+
     /// eg `saturn = "^0.3.1"` or `matplotlib = "3.1.1"`
     pub fn to_cfg_string(&self) -> String {
         match self.constraints.len() {
             0 => {
                 let (name, latest_version) = if let Ok((fmtd_name, version, _)) =
-                    dep_resolution::get_version_info(&self.name)
-                {
+                    res::get_version_info(
+                        &self.name,
+                        Some(Req::new_with_extras(
+                            self.name.clone(),
+                            vec![Constraint::new_any()],
+                            Extras::new_py(Constraint::new(
+                                ReqType::Exact,
+                                self.py_ver_or_default(),
+                            )),
+                        )),
+                    ) {
                     (fmtd_name, version)
                 } else {
                     util::abort(&format!("Unable to find version info for {:?}", &self.name));
@@ -668,6 +971,17 @@ impl Req {
                     .join(", ")
             ),
         }
+    }
+
+    pub fn py_ver_or_default(&self) -> Version {
+        let default = vec![Constraint::from_str("==*").ok().unwrap()];
+        self.python_version
+            .as_ref()
+            .unwrap_or(&default)
+            .first()
+            .unwrap()
+            .version
+            .clone()
     }
 
     /// Format for setup.py
@@ -692,14 +1006,19 @@ impl fmt::Display for Req {
         for constr in &self.constraints {
             constraints.push_str(&format!("{}", constr));
         }
-        write!(
-            f,
-            "{}{} {}{}",
-            Colored::Fg(Color::DarkCyan),
-            self.name,
-            constraints,
-            Colored::Fg(Color::Reset)
-        )
+        let bufwtr = BufferWriter::stdout(CliConfig::current().color_choice);
+        let mut buf = bufwtr.buffer();
+        if let Err(_e) = buf.set_color(ColorSpec::new().set_fg(Some(Color::Cyan))) {
+            // Dark
+            panic!("An Error occurred formatting Req")
+        }
+        if let Err(_e) = write!(buf, "{} {}", self.name, constraints) {
+            panic!("An Error occurred formatting Req")
+        }
+        if let Err(_e) = buf.reset() {
+            panic!("An Error occurred formatting Req")
+        }
+        write!(f, "{}", String::from_utf8_lossy(buf.as_slice()))
     }
 }
 
@@ -745,44 +1064,270 @@ pub struct Lock {
 
 #[cfg(test)]
 pub mod tests {
+    use rstest::rstest;
     use ReqType::*;
     use VersionModifier::*;
 
     use super::*;
 
-    #[test]
-    fn compat_caret() {
-        let req1 = Constraint::new(Caret, Version::new(1, 2, 3));
-        let req2 = Constraint::new(Caret, Version::new(0, 2, 3));
-        let req3 = Constraint::new(Caret, Version::new(0, 0, 3));
-        let req4 = Constraint::new(Caret, Version::new(0, 0, 3));
-
-        assert!(req1.is_compatible(&Version::new(1, 9, 9)));
-        assert!(!req1.is_compatible(&Version::new(2, 0, 0)));
-        assert!(req2.is_compatible(&Version::new(0, 2, 9)));
-        assert!(!req2.is_compatible(&Version::new(0, 3, 0)));
-        assert!(req3.is_compatible(&Version::new(0, 0, 3)));
-        assert!(!req3.is_compatible(&Version::new(0, 0, 5)));
-        // Caret requirements below major and minor v 0 must be exact.
-        assert!(req4.is_compatible(&Version::new(0, 0, 3)));
-        //        assert!(!req4.is_compatible(&Version::new(0, 0, 4)));
-        assert!(!req4.is_compatible(&Version::new(0, 0, 5)));
+    #[rstest(
+        req,
+        max_compat,
+        not_compat,
+        case::caret_full_version(
+            Constraint::new(Caret, Version::new(1, 2, 3)),
+            Version::new(1, 9, MAX_VER),
+            Version::new(2, 0, 0)
+        ),
+        case::caret_minor_version(
+            Constraint::new(Caret, Version::new(0, 2, 3)),
+            Version::new(0, 2, MAX_VER),
+            Version::new(0, 3, 0)
+        ),
+        case::caret_patch_version_is_exact_over(
+            Constraint::new(Caret, Version::new(0, 0, 3)),
+            Version::new(0, 0, 3),
+            Version::new(0, 0, 4)
+        ),
+        case::caret_patch_version_is_exact_under(
+            Constraint::new(Caret, Version::new(0, 0, 3)),
+            Version::new(0, 0, 3),
+            Version::new(0, 0, 2)
+        ),
+        case::gte_max(
+            Constraint::new(Gte, Version::new(1, 2, 3)),
+            Version::_max(),
+            Version::new(1, 2, 2)
+        ),
+        case::gte_eq(
+            Constraint::new(Gte, Version::new(1, 2, 3)),
+            Version::new(1, 2, 3),
+            Version::new(1, 2, 2)
+        ),
+        case::gte_misc(
+            Constraint::new(Gte, Version::new(1, 2, 3)),
+            Version::new(2, 1, 2),
+            Version::new(1, 2, 2)
+        ),
+        case::gt_max(
+            Constraint::new(Gt, Version::new(0, 2, 3)),
+            Version::_max(),
+            Version::new(0, 2, 3)
+        ),
+        case::gt_first(
+            Constraint::new(Gt, Version::new(0, 2, 3)),
+            Version::new(0, 2, 4),
+            Version::new(0, 2, 3)
+        ),
+        case::exact_over(
+            Constraint::new(Exact, Version::new(1, 2, 3)),
+            Version::new(1, 2, 3),
+            Version::new(1, 2, 4)
+        ),
+        case::exact_under(
+            Constraint::new(Exact, Version::new(1, 2, 3)),
+            Version::new(1, 2, 3),
+            Version::new(1, 2, 2)
+        ),
+        case::ne_over(
+            Constraint::new(Ne, Version::new(1, 2, 3)),
+            Version::new(1, 2, 4),
+            Version::new(1, 2, 3)
+        ),
+        case::ne_under(
+            Constraint::new(Ne, Version::new(1, 2, 3)),
+            Version::new(1, 2, 2),
+            Version::new(1, 2, 3)
+        ),
+        case::lt_max(
+            Constraint::new(Lt, Version::new(1, 2, 3)),
+            Version::new(1, 2, 2),
+            Version::new(1, 2, 3)
+        ),
+        case::lt_min(
+            Constraint::new(Lt, Version::new(1, 2, 3)),
+            Version::new(0, 0, 0),
+            Version::new(1, 2, 3)
+        ),
+        case::lte_max(
+            Constraint::new(Lte, Version::new(1, 2, 3)),
+            Version::new(1, 2, 3),
+            Version::new(1, 2, 4)
+        ),
+        case::lte_min(
+            Constraint::new(Lte, Version::new(1, 2, 3)),
+            Version::new(0, 0, 0),
+            Version::new(1, 2, 4)
+        ),
+        case::tilde_full_version_max(
+            Constraint::new(Tilde, Version::new(1, 2, 3)),
+            Version::new(1, 2, MAX_VER),
+            Version::new(1, 3, 0)
+        ),
+        case::tilde_full_version_min(
+            Constraint::new(Tilde, Version::new(1, 2, 3)),
+            Version::new(1, 2, MAX_VER),
+            Version::new(1, 2, 2)
+        ),
+        case::tilde_minor_version_max(
+            Constraint::new(Tilde, Version::new_short(1, 2)),
+            Version::new(1, 2, MAX_VER),
+            Version::new(1, 3, 0)
+        ),
+        case::tilde_minor_version_min(
+            Constraint::new(Tilde, Version::new_short(1, 2)),
+            Version::new(1, 2, MAX_VER),
+            Version::new(1, 1, MAX_VER)
+        ),
+        case::tilde_major_version_max(
+            Constraint::new(Tilde, Version::new_opt(Some(1), None, None)),
+            Version::new(1, MAX_VER, MAX_VER),
+            Version::new(2, 0, 0)
+        ),
+        case::tilde_major_version_under(
+            Constraint::new(Tilde, Version::new_opt(Some(1), None, None)),
+            Version::new(1, MAX_VER, MAX_VER),
+            Version::new(0, MAX_VER, MAX_VER)
+        ),
+        case::tilde_eq_full_version_max(
+            Constraint::new(TildeEq, Version::new(1, 2, 3)),
+            Version::new(1, 2, MAX_VER),
+            Version::new(1, 3, 0)
+        ),
+        case::tilde_eq_full_version_min(
+            Constraint::new(TildeEq, Version::new(1, 2, 3)),
+            Version::new(1, 2, MAX_VER),
+            Version::new(1, 2, 2)
+        ),
+        case::tilde_eq_minor_version_max(
+            Constraint::new(TildeEq, Version::new_short(1, 2)),
+            Version::new(1, MAX_VER, MAX_VER),
+            Version::new(2, 0, 0)
+        ),
+        case::tilde_eq_minor_version_min(
+            Constraint::new(TildeEq, Version::new_short(1, 2)),
+            Version::new(1, MAX_VER, MAX_VER),
+            Version::new(1, 1, MAX_VER)
+        ),
+        #[should_panic]
+        case::tilde_eq_major_version_max(
+            Constraint::new(TildeEq, Version::new_opt(Some(1), None, None)),
+            Version::new(1, MAX_VER, MAX_VER),
+            Version::new(2, 0, 0)
+        ),
+        #[should_panic]
+        case::tilde_eq_major_version_under(
+            Constraint::new(TildeEq, Version::new_opt(Some(1), None, None)),
+            Version::new(1, MAX_VER, MAX_VER),
+            Version::new(0, MAX_VER, MAX_VER)
+        ),
+        #[should_panic(expected="assertion failed: !req.is_compatible(&not_compat)")]
+        case::star_major_version(
+            Constraint::new(Exact, Version::new_star(None, None, None, true)),
+            Version{
+                major: Some(1),
+                minor: Some(2),
+                patch: Some(3),
+                extra_num: Some(MAX_VER),
+                modifier: Some((VersionModifier::Beta, 1)),
+                star: false,
+            },
+            Version::new_star(None, None, None, false)
+        ),
+        case::star_minor_version_min(
+            Constraint::new(Exact, Version::new_star(Some(1), None, None, true)),
+            Version::new(1, MAX_VER, MAX_VER),
+            Version::new(0, MAX_VER, MAX_VER)
+        ),
+        case::star_minor_version_max(
+            Constraint::new(Exact, Version::new_star(Some(1), None, None, true)),
+            Version::new(1, MAX_VER, MAX_VER),
+            Version::new(2, 0, 0)
+        ),
+        case::star_patch_version_min(
+            Constraint::new(Exact, Version::new_star(Some(1), Some(2), None, true)),
+            Version::new(1, 2, MAX_VER),
+            Version::new(0, 1, MAX_VER)
+        ),
+        case::star_minor_version_max(
+            Constraint::new(Exact, Version::new_star(Some(1), Some(2), None, true)),
+            Version::new(1, 2, MAX_VER),
+            Version::new(1, 3, 0)
+        ), // TODO: Test below patch. Right now we don't check compatible below patch level
+        case::star_extra_num_version_max(
+            Constraint::new(Exact, Version{
+                major: Some(1),
+                minor: Some(2),
+                patch: Some(3),
+                extra_num: None,
+                modifier: None,
+                star:true}),
+            Version{
+                major: Some(1),
+                minor: Some(2),
+                patch: Some(3),
+                extra_num: Some(MAX_VER),
+                modifier: Some((VersionModifier::Beta, 1)),
+                star: false,
+            },
+            Version::new(1, 3, 0)
+        ),
+    )]
+    fn is_compatible(req: Constraint, max_compat: Version, not_compat: Version) {
+        if !req.is_compatible(&max_compat) {
+            eprintln!(
+                "req: {:?}\nmax_compat: {:?}\ncompat range: {:?}",
+                req,
+                max_compat,
+                req.compatible_range()
+            );
+        }
+        if req.is_compatible(&not_compat) {
+            eprintln!(
+                "req: {:?}\nnot_compat: {:?}\ncompat range: {:?}",
+                req,
+                not_compat,
+                req.compatible_range()
+            );
+        }
+        assert!(req.is_compatible(&max_compat));
+        assert!(!req.is_compatible(&not_compat));
     }
 
-    #[test]
-    fn compat_gt_eq() {
-        let req1 = Constraint::new(Gte, Version::new(1, 2, 3));
-        let req2 = Constraint::new(Gt, Version::new(0, 2, 3));
-        let req3 = Constraint::new(Exact, Version::new(0, 0, 3));
+    #[rstest(
+        ver_str,
+        is_compat,
+        case::exact("==1.1", true),
+        case::zero_padded("==1.1.0", true),
+        case::dev_release("==1.1.dev1", false),
+        case::pre_release("==1.1a1", false),
+        case::post_release("==1.1.post1", false),
+        case::star("==1.1.*", true)
+    )]
+    fn pep440_bare(ver_str: &str, is_compat: bool) {
+        let ver_match = Version::new_short(1, 1);
+        let constraint = Constraint::from_str(ver_str).unwrap();
+        assert_eq!(constraint.is_compatible(&ver_match), is_compat);
+    }
 
-        assert!(req1.is_compatible(&Version::new(1, 2, 3)));
-        assert!(req1.is_compatible(&Version::new_short(4, 2)));
-        assert!(!req1.is_compatible(&Version::new(1, 2, 2)));
-        assert!(req2.is_compatible(&Version::new(0, 2, 9)));
-        assert!(!req2.is_compatible(&Version::new(0, 1, 0)));
-        assert!(!req2.is_compatible(&Version::new(0, 2, 3)));
-        assert!(req3.is_compatible(&Version::new(0, 0, 3)));
-        assert!(!req3.is_compatible(&Version::new(0, 0, 5)));
+    #[rstest(
+        ver_str,
+        is_compat,
+        case::exact("==1.1.post1", true),
+        case::bare("==1.1", false),
+        case::star("==1.1.*", true)
+    )]
+    fn pep440_post(ver_str: &str, is_compat: bool) {
+        let ver_match = Version::from_str("1.1.post1").unwrap();
+        let constraint = Constraint::from_str(ver_str).unwrap();
+        if constraint.is_compatible(&ver_match) != is_compat {
+            eprintln!(
+                "ver_match: {:?}\nconstraint: {:?}\nshould be compat: {:?}",
+                ver_match, constraint, is_compat
+            );
+        }
+
+        assert_eq!(constraint.is_compatible(&ver_match), is_compat);
     }
 
     #[test]
@@ -795,9 +1340,18 @@ pub mod tests {
 
     #[test]
     fn version_parse_w_wildcard() {
-        assert_eq!(Version::from_str("3.2.*").unwrap(), Version::new(3, 2, 0));
-        assert_eq!(Version::from_str("1.*").unwrap(), Version::new(1, 0, 0));
-        assert_eq!(Version::from_str("1.*.*").unwrap(), Version::new(1, 0, 0));
+        assert_eq!(
+            Version::from_str("3.2.*").unwrap(),
+            Version::new_star(Some(3), Some(2), None, true)
+        );
+        assert_eq!(
+            Version::from_str("1.*").unwrap(),
+            Version::new_star(Some(1), None, None, true)
+        );
+        assert_eq!(
+            Version::from_str("1.*.*").unwrap(),
+            Version::new_star(Some(1), None, None, true)
+        );
     }
 
     #[test]
@@ -805,44 +1359,48 @@ pub mod tests {
         assert_eq!(
             Version::from_str("19.3b0").unwrap(),
             Version {
-                major: 19,
-                minor: 3,
-                patch: 0,
+                major: Some(19),
+                minor: Some(3),
+                patch: Some(0),
                 extra_num: None,
                 modifier: Some((Beta, 0)),
+                star: false,
             }
         );
 
         assert_eq!(
             Version::from_str("1.3.5rc0").unwrap(),
             Version {
-                major: 1,
-                minor: 3,
-                patch: 5,
+                major: Some(1),
+                minor: Some(3),
+                patch: Some(5),
                 extra_num: None,
                 modifier: Some((ReleaseCandidate, 0)),
+                star: false,
             }
         );
 
         assert_eq!(
             Version::from_str("1.3.5.11").unwrap(),
             Version {
-                major: 1,
-                minor: 3,
-                patch: 5,
+                major: Some(1),
+                minor: Some(3),
+                patch: Some(5),
                 extra_num: Some(11),
                 modifier: None,
+                star: false,
             }
         );
 
         assert_eq!(
             Version::from_str("5.2.5.11b3").unwrap(),
             Version {
-                major: 5,
-                minor: 2,
-                patch: 5,
+                major: Some(5),
+                minor: Some(2),
+                patch: Some(5),
                 extra_num: Some(11),
                 modifier: Some((Beta, 3)),
+                star: false,
             }
         );
     }
@@ -866,31 +1424,34 @@ pub mod tests {
         let req_a = Constraint::new(
             Ne,
             Version {
-                major: 2,
-                minor: 3,
-                patch: 0,
+                major: Some(2),
+                minor: Some(3),
+                patch: Some(0),
                 extra_num: None,
                 modifier: Some((Beta, 3)),
+                star: false,
             },
         );
         let req_b = Constraint::new(
             Caret,
             Version {
-                major: 1,
-                minor: 3,
-                patch: 32,
+                major: Some(1),
+                minor: Some(3),
+                patch: Some(32),
                 extra_num: None,
                 modifier: Some((ReleaseCandidate, 1)),
+                star: false,
             },
         );
         let req_c = Constraint::new(
             Caret,
             Version {
-                major: 1,
-                minor: 3,
-                patch: 32,
+                major: Some(1),
+                minor: Some(3),
+                patch: Some(32),
                 extra_num: None,
                 modifier: Some((Dep, 1)),
+                star: false,
             },
         );
 
@@ -973,7 +1534,7 @@ pub mod tests {
             constraints: vec![],
             extra: Some("test".into()),
             sys_platform: None,
-            python_version: Some(Constraint::new(Exact, Version::new(2, 7, 0))),
+            python_version: Some(vec![Constraint::new(Exact, Version::new(2, 7, 0))]),
             install_with_extras: None,
             path: None,
             git: None,
@@ -990,7 +1551,7 @@ pub mod tests {
             constraints: vec![Constraint::new(Gte, Version::new(0, 5, 0))],
             extra: None,
             sys_platform: Some((Exact, crate::Os::Windows32)),
-            python_version: Some(Constraint::new(Lt, Version::new(3, 6, 0))),
+            python_version: Some(vec![Constraint::new(Lt, Version::new(3, 6, 0))]),
             install_with_extras: None,
             path: None,
             git: None,
@@ -1129,18 +1690,18 @@ pub mod tests {
         assert_eq!(b, Req::new("zc.lockfile".into(), vec![]));
     }
 
-    #[test]
-    fn parse_req_pypi_tilde() {
-        let a = Req::from_str("asgiref (~=3.2)", true).unwrap();
-        let b = Req::from_str("asgiref (~3.2)", true).unwrap();
+    #[rstest(
+        input,
+        expected,
+        case("asgiref (~=3.2)", Constraint::new(TildeEq, Version::new(3, 2, 0))),
+        case("asgiref (~3.2)", Constraint::new(Tilde, Version::new(3, 2, 0)))
+    )]
+    fn parse_req_pypi_tilde(input: &str, expected: Constraint) {
+        let a = Req::from_str(input, true).unwrap();
 
-        let expected = Req::new(
-            "asgiref".into(),
-            vec![Constraint::new(Tilde, Version::new(3, 2, 0))],
-        );
+        let rexpected = Req::new("asgiref".into(), vec![expected]);
 
-        assert_eq!(a, expected);
-        assert_eq!(b, expected);
+        assert_eq!(a, rexpected);
     }
 
     #[test]
@@ -1173,36 +1734,73 @@ pub mod tests {
         )
     }
 
-    #[test]
-    fn req_tostring_single_reqs() {
-        // todo: Expand this with more cases
-
-        let a = Req::new(
-            "package".to_string(),
-            vec![Constraint::new(Exact, Version::new(3, 3, 6))],
-        );
-
-        //        assert_eq!(a._to_pip_string(), "package==3.3.6".to_string());
-        assert_eq!(a.to_cfg_string(), r#"package = "3.3.6""#.to_string());
+    #[rstest(
+        req,
+        expected,
+        case::exact(Req::new("package".to_string(),
+                             vec![
+                                 Constraint::new(Exact, Version::new(1,2,3))
+                             ]),
+                    r#"package = "1.2.3""#),
+        case::gte(Req::new("package".to_string(),
+                           vec![
+                               Constraint::new(Gte, Version::new(1,2,3))
+                           ]),
+                  r#"package = ">=1.2.3""#),
+        case::lte(Req::new("package".to_string(),
+                           vec![
+                               Constraint::new(Lte, Version::new(1,2,3))
+                           ]),
+                  r#"package = "<=1.2.3""#),
+        case::ne(Req::new("package".to_string(),
+                          vec![
+                              Constraint::new(Ne, Version::new(1,2,3))
+                          ]),
+                 r#"package = "!=1.2.3""#),
+        case::gt(Req::new("package".to_string(),
+                          vec![
+                              Constraint::new(Gt, Version::new(1,2,3))
+                          ]),
+                 r#"package = ">1.2.3""#),
+        case::lt(Req::new("package".to_string(),
+                          vec![
+                              Constraint::new(Lt, Version::new(1,2,3))
+                          ]),
+                 r#"package = "<1.2.3""#),
+        case::caret(Req::new("package".to_string(),
+                             vec![
+                                 Constraint::new(Caret, Version::new(1,2,3))
+                             ]),
+                    r#"package = "^1.2.3""#),
+        case::tilde(Req::new("package".to_string(),
+                             vec![
+                                 Constraint::new(Tilde, Version::new(1,2,3))
+                             ]),
+                    r#"package = "~1.2.3""#),
+        case::multi_ne_gte(Req::new("package".to_string(),
+                                    vec![
+                                        Constraint::new(Ne, Version::new(1,2,3)),
+                                        Constraint::new(Gte, Version::new(1,2,0))
+                                    ]),
+                           r#"package = "!=1.2.3, >=1.2.0""#)
+    )]
+    fn req_to_cfg_string(req: Req, expected: &str) {
+        assert_eq!(req.to_cfg_string(), expected.to_string());
     }
 
     #[test]
-    fn req_tostring_multiple_reqs() {
-        // todo: Expand this with more cases
-
-        let a = Req::new(
-            "package".to_string(),
-            vec![
-                Constraint::new(Ne, Version::new(2, 7, 4)),
-                Constraint::new(Gte, Version::new(3, 7, 0)),
-            ],
-        );
-
-        //        assert_eq!(a._to_pip_string(), "'package!=2.7.4,>=3.7'".to_string());
-        assert_eq!(
-            a.to_cfg_string(),
-            r#"package = "!=2.7.4, >=3.7.0""#.to_string()
-        );
+    fn req_to_cfg_string_empty_constraints() {
+        let ctx = res::get_version_info_context();
+        ctx.expect().returning(|name, py_ver| {
+            Ok((
+                name.to_string(),
+                Version::new(1, 2, 3),
+                vec![Version::new(1, 2, 3), Version::new(1, 1, 2)],
+            ))
+        });
+        let req = Req::new("package".to_string(), vec![]);
+        let expected = r#"package = "^1.2.3""#;
+        assert_eq!(req.to_cfg_string(), expected.to_string());
     }
 
     #[test]
@@ -1222,59 +1820,74 @@ pub mod tests {
     #[test]
     fn version_ordering_modded() {
         let a = Version {
-            major: 4,
-            minor: 9,
-            patch: 4,
+            major: Some(4),
+            minor: Some(9),
+            patch: Some(4),
             extra_num: Some(2),
             modifier: None,
+            star: false,
         };
         let b = Version::new(4, 9, 4);
 
         let c = Version {
-            major: 4,
-            minor: 9,
-            patch: 4,
+            major: Some(4),
+            minor: Some(9),
+            patch: Some(4),
             extra_num: None,
             modifier: Some((VersionModifier::ReleaseCandidate, 2)),
+            star: false,
         };
         let d = Version {
-            major: 4,
-            minor: 9,
-            patch: 4,
+            major: Some(4),
+            minor: Some(9),
+            patch: Some(4),
             extra_num: None,
             modifier: Some((VersionModifier::ReleaseCandidate, 1)),
+            star: false,
         };
         let e = Version {
-            major: 4,
-            minor: 9,
-            patch: 4,
+            major: Some(4),
+            minor: Some(9),
+            patch: Some(4),
             extra_num: None,
             modifier: Some((VersionModifier::Beta, 6)),
+            star: false,
         };
         let f = Version {
-            major: 4,
-            minor: 9,
-            patch: 4,
+            major: Some(4),
+            minor: Some(9),
+            patch: Some(4),
             extra_num: None,
             modifier: Some((VersionModifier::Alpha, 7)),
+            star: false,
         };
         let g = Version::new(4, 9, 2);
 
         assert!(a > b && b > c && c > d && d > e && e > f && f > g);
     }
 
-    #[test]
-    fn compat_rng() {
-        let actual1 = Constraint::new(Gte, Version::new(5, 1, 0)).compatible_range();
-        let expected1 = vec![(Version::new(5, 1, 0), Version::_max())];
-
-        let actual2 = Constraint::new(Ne, Version::new(5, 1, 3)).compatible_range();
-        let expected2 = vec![
-            (Version::new(0, 0, 0), Version::new(5, 1, 2)),
-            (Version::new(5, 1, 4), Version::_max()),
-        ];
-        assert_eq!(expected1, actual1);
-        assert_eq!(expected2, actual2);
+    #[rstest(actual,
+             expected,
+             case::gt(Constraint::new(Gt, Version::new(5, 1, 3)),
+                      vec![(Version::new(5, 1, 4), Version::_max())]),
+             case::gte(Constraint::new(Gte, Version::new(5, 1, 0)),
+                       vec![(Version::new(5, 1, 0), Version::_max())] ),
+             case::ne(Constraint::new(Ne, Version::new(5, 1, 3)),
+                      vec![(Version::new(0, 0, 0), Version::new(5, 1, 2)),
+                           (Version::new(5, 1, 4), Version::_max()),]),
+             case::lt(Constraint::new(Lt, Version::new(5, 1, 3)),
+                      vec![(Version::new(0, 0, 0), Version::new(5, 1, 2))]),
+             case::lte(Constraint::new(Lte, Version::new(5, 1, 3)),
+                       vec![(Version::new(0, 0, 0), Version::new(5, 1, 3))]),
+             case::caret(Constraint::new(Caret, Version::new(1,2,3)),
+                         vec![(Version::new(1,2,3), Version::new(1,MAX_VER,MAX_VER))]
+             ),
+             case::tilde(Constraint::new(Tilde, Version::new(1,2,3)),
+                         vec![(Version::new(1,2,3), Version::new(1,2,MAX_VER))]
+             )
+    )]
+    fn compat_rng(actual: Constraint, expected: Vec<(Version, Version)>) {
+        assert_eq!(actual.compatible_range(), expected);
     }
 
     #[test]
@@ -1295,8 +1908,8 @@ pub mod tests {
 
     #[test]
     fn intersections_simple() {
-        let reqs1 = (Version::new(4, 9, 4), Version::new(MAX_VER, 0, 0));
-        let reqs2 = (Version::new(4, 3, 1), Version::new(MAX_VER, 0, 0));
+        let reqs1 = (Version::new(4, 9, 4), Version::_max());
+        let reqs2 = (Version::new(4, 3, 1), Version::_max());
 
         let reqs3 = (Version::new(3, 0, 0), Version::new(3, 9, 0));
         let reqs4 = (Version::new(3, 3, 6), Version::new(3, 3, 6));
@@ -1374,38 +1987,28 @@ pub mod tests {
         );
     }
 
-    #[test]
-    fn python_version_from_warehouse() {
-        let a1 = Constraint::from_wh_py_vers("py3").unwrap();
-        let a2 = Constraint::from_wh_py_vers("cp35.cp36.cp37.cp38").unwrap();
-        let a3 = Constraint::from_wh_py_vers("cp26").unwrap();
-        let a4 = Constraint::from_wh_py_vers("py2.py3").unwrap();
-        let a5 = Constraint::from_wh_py_vers("pp36").unwrap();
-        let a6 = Constraint::from_wh_py_vers("any").unwrap();
-        let a7 = Constraint::from_wh_py_vers("2.7").unwrap();
-
-        assert_eq!(a1, vec![Constraint::new(Gte, Version::new(3, 0, 0))]);
-        assert_eq!(
-            a2,
-            vec![
-                Constraint::new(Exact, Version::new(3, 5, 0)),
-                Constraint::new(Exact, Version::new(3, 6, 0)),
-                Constraint::new(Exact, Version::new(3, 7, 0)),
-                Constraint::new(Exact, Version::new(3, 8, 0)),
-            ]
-        );
-        assert_eq!(a3, vec![Constraint::new(Exact, Version::new(2, 6, 0))]);
-
-        assert_eq!(
-            a4,
-            vec![
-                Constraint::new(Lte, Version::new(2, 10, 0)),
-                Constraint::new(Gte, Version::new(3, 0, 0)),
-            ]
-        );
-
-        assert_eq!(a5, vec![Constraint::new(Exact, Version::new(3, 6, 0))]);
-        assert_eq!(a6, vec![Constraint::new(Gte, Version::new(2, 0, 0))]);
-        assert_eq!(a7, vec![Constraint::new(Caret, Version::new(2, 7, 0))]);
+    #[rstest(input, expected,
+             case::py3("py3", vec![Constraint::new(Gte, Version::new(3, 0, 0))]),
+             case::cp_chain("cp35.cp36.cp37.cp38",
+                            vec![
+                                Constraint::new(Exact, Version::new(3, 5, 0)),
+                                Constraint::new(Exact, Version::new(3, 6, 0)),
+                                Constraint::new(Exact, Version::new(3, 7, 0)),
+                                Constraint::new(Exact, Version::new(3, 8, 0)),
+                            ]),
+             case::cp26("cp26", vec![Constraint::new(Exact, Version::new(2, 6, 0))]),
+             case::py_chain("py2.py3",
+                            vec![
+                                Constraint::new(Lte, Version::new(2, 10, 0)),
+                                Constraint::new(Gte, Version::new(3, 0, 0)),
+                            ]),
+             case::pp36("pp36", vec![Constraint::new(Exact, Version::new(3, 6, 0))]),
+             case::any("any", vec![Constraint::new(Gte, Version::new(2, 0, 0))]),
+             case::semver("2.7", vec![Constraint::new(Caret, Version::new(2, 7, 0))]),
+             case::pp257("pp257", vec![Constraint::new(Exact, Version::new(2, 5, 7))])
+    )]
+    fn python_version_from_warehouse(input: &str, expected: Vec<Constraint>) {
+        let a1 = Constraint::from_wh_py_vers(input).unwrap();
+        assert_eq!(a1, expected)
     }
 }

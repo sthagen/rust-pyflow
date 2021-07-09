@@ -1,15 +1,21 @@
 #![allow(clippy::non_ascii_literal)]
 
-use crate::dep_types::{Constraint, Lock, LockPackage, Package, Rename, Req, ReqType, Version};
+#[mockall_double::double]
+use crate::dep_resolution::res;
+use crate::dep_types::{
+    Constraint, Extras, Lock, LockPackage, Package, Rename, Req, ReqType, Version,
+};
 use crate::util::{abort, Os};
-use crossterm::{Color, Colored};
+
 use regex::Regex;
 use serde::Deserialize;
 use std::{collections::HashMap, env, error::Error, fs, path::PathBuf, str::FromStr};
 
 use std::io::{BufRead, BufReader};
 use std::path::Path;
+use std::sync::{Arc, RwLock};
 use structopt::StructOpt;
+use termcolor::{Color, ColorChoice};
 
 mod build;
 mod commands;
@@ -36,12 +42,11 @@ type PackToInstall = ((String, Version), Option<(u32, String)>); // ((Name, Vers
 #[structopt(name = "pyflow", about = "Python packaging and publishing")]
 struct Opt {
     #[structopt(subcommand)]
-    subcmds: Option<SubCommand>,
-    #[structopt(name = "script")]
-    script: Vec<String>,
+    subcmds: SubCommand,
 
-    #[structopt(short = "ms", long)]
-    ms: Vec<String>,
+    /// Force a color option: auto (default), always, ansi, never
+    #[structopt(short, long)]
+    color: Option<String>,
 }
 
 #[derive(StructOpt, Debug)]
@@ -71,12 +76,6 @@ enum SubCommand {
         #[structopt(name = "packages")]
         packages: Vec<String>,
     },
-    /// Run python
-    #[structopt(name = "python")]
-    Python {
-        #[structopt(name = "args")]
-        args: Vec<String>,
-    },
     /// Display all installed packages and console scripts
     #[structopt(name = "list")]
     List,
@@ -100,24 +99,20 @@ enum SubCommand {
     Clear,
     /// Run a CLI script like `ipython` or `black`. Note that you can simply run `pyflow black`
     /// as a shortcut.
-    #[structopt(name = "run")] // We don't need to invoke this directly, but the option exists
-    Run {
-        #[structopt(name = "args")]
-        args: Vec<String>,
-    },
+    // Dummy option with space at the end for documentation
+    #[structopt(name = "run ")] // We don't need to invoke this directly, but the option exists
+    Run,
 
-    ////    // todo: Trying to get `python -m myproject` syntax working, ie https://docs.python.org/3/library/__main__.html
-    //    #[structopt(short = "m", long = "dashm")]
-    //    DashM {
-    //        #[structopt(name = "args")]
-    //        args: Vec<String>,
-    //    },
+    /// Run the project python or script with the project python environment.
+    /// As a shortcut you can simply specify a script name ending in `.py`
+    // Dummy option with space at the end for documentation
+    #[structopt(name = "python ")]
+    Python,
+
     /// Run a standalone script not associated with a project
-    #[structopt(name = "script")]
-    Script {
-        #[structopt(name = "args")]
-        args: Vec<String>,
-    },
+    // Dummy option with space at the end for documentation
+    #[structopt(name = "script ")]
+    Script,
     //    /// Run a package globally; used for CLI tools like `ipython` and `black`. Doesn't
     //    /// interfere Python installations. Must have been installed with `pyflow install -g black` etc
     //    #[structopt(name = "global")]
@@ -132,8 +127,74 @@ enum SubCommand {
         #[structopt(name = "version")]
         version: String,
     },
+    // Documentation for supported external subcommands can be documented by
+    // adding a `dummy` subcommand with the name having a trailing space.
+    // #[structopt(name = "external ")]
+    #[structopt(external_subcommand, name = "external")]
+    External(Vec<String>),
 }
 
+#[derive(Clone, Debug)]
+enum ExternalSubcommands {
+    Run,
+    Script,
+    Python,
+    ImpliedRun(String),
+    ImpliedPython(String),
+}
+
+impl ToString for ExternalSubcommands {
+    fn to_string(&self) -> String {
+        match self {
+            Self::Run => "run".into(),
+            Self::Script => "script".into(),
+            Self::Python => "python".into(),
+            Self::ImpliedRun(x) => x.into(),
+            Self::ImpliedPython(x) => x.into(),
+        }
+    }
+}
+
+impl FromStr for ExternalSubcommands {
+    type Err = anyhow::Error;
+    fn from_str(s: &str) -> anyhow::Result<Self> {
+        let result = match s {
+            "run" => Self::Run,
+            "script" => Self::Script,
+            "python" => Self::Python,
+            x if x.ends_with(".py") => Self::ImpliedPython(x.to_string()),
+            x => Self::ImpliedRun(x.to_string()),
+        };
+        Ok(result)
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ExternalCommand {
+    cmd: ExternalSubcommands,
+    args: Vec<String>,
+}
+
+impl ExternalCommand {
+    fn from_opt(args: Vec<String>) -> Self {
+        let cmd = ExternalSubcommands::from_str(&args[0]).unwrap();
+        let cmd_args = match cmd {
+            ExternalSubcommands::Run
+            | ExternalSubcommands::Script
+            | ExternalSubcommands::Python => &args[1..],
+            ExternalSubcommands::ImpliedRun(_) | ExternalSubcommands::ImpliedPython(_) => &args,
+        };
+        let cmd = match cmd {
+            ExternalSubcommands::ImpliedRun(_) => ExternalSubcommands::Run,
+            ExternalSubcommands::ImpliedPython(_) => ExternalSubcommands::Python,
+            x => x,
+        };
+        Self {
+            cmd,
+            args: cmd_args.to_vec(),
+        }
+    }
+}
 /// A config, parsed from pyproject.toml
 #[derive(Clone, Debug, Default, Deserialize)]
 // todo: Auto-desr some of these
@@ -257,10 +318,9 @@ impl Config {
                         git = Some(repo);
                     }
                     if let Some(v) = subdata.python {
-                        python_version = Some(
-                            Constraint::from_str(&v)
-                                .expect("Problem parsing python version in dependency"),
-                        );
+                        let pv = Constraint::from_str(&v)
+                            .expect("Problem parsing python version in dependency");
+                        python_version = Some(vec![pv]);
                     }
                 }
             }
@@ -395,17 +455,16 @@ impl Config {
                                 extras = Some(ex);
                             }
                             if let Some(v) = subdata.python {
-                                python_version = Some(
-                                    Constraint::from_str(&v)
-                                        .expect("Problem parsing python version in dependency"),
-                                );
+                                let pv = Constraint::from_str(&v)
+                                    .expect("Problem parsing python version in dependency");
+                                python_version = Some(vec![pv]);
                             }
                             // todo repository etc
                         }
                     }
                     if &name.to_lowercase() == "python" {
                         if let Some(constr) = constraints.get(0) {
-                            result.py_version = Some(constr.version)
+                            result.py_version = Some(constr.version.clone())
                         }
                     } else {
                         result.reqs.push(Req {
@@ -528,8 +587,8 @@ impl Config {
         } else {
             result.push_str(&("py_version = \"3.8\"".to_owned() + "\n"));
         }
-        if let Some(vers) = self.version {
-            result.push_str(&(format!("version = \"{}\"", vers.to_string2()) + "\n"));
+        if let Some(vers) = self.version.clone() {
+            result.push_str(&(format!("version = \"{}\"", vers.to_string() + "\n")));
         } else {
             result.push_str("version = \"0.1.0\"");
             result.push('\n');
@@ -580,6 +639,32 @@ impl Config {
     }
 }
 
+/// Cli Config to hold command line options
+struct CliConfig {
+    pub color_choice: ColorChoice,
+}
+
+impl Default for CliConfig {
+    fn default() -> Self {
+        Self {
+            color_choice: ColorChoice::Auto,
+        }
+    }
+}
+
+impl CliConfig {
+    pub fn current() -> Arc<CliConfig> {
+        CLI_CONFIG.with(|c| c.read().unwrap().clone())
+    }
+    pub fn make_current(self) {
+        CLI_CONFIG.with(|c| *c.write().unwrap() = Arc::new(self))
+    }
+}
+
+thread_local! {
+    static CLI_CONFIG: RwLock<Arc<CliConfig>> = RwLock::new(Default::default());
+}
+
 /// Create a template directory for a python project.
 pub fn new(name: &str) -> Result<(), Box<dyn Error>> {
     if !PathBuf::from(name).exists() {
@@ -620,7 +705,7 @@ __pypackages__/
     if commands::git_init(Path::new(name)).is_err() {
         util::print_color(
             "Unable to initialize a git repo for your project",
-            Color::DarkYellow,
+            Color::Yellow, // Dark
         );
     };
 
@@ -669,11 +754,7 @@ fn sync_deps(
                     util::standardize_name(&lp.name),
                     Version::from_str(&lp.version).expect("Problem parsing lock version"),
                 ),
-                match &lp.rename {
-                    // todo back to our custom type?
-                    Some(rn) => Some(parse_lockpack_rename(rn)),
-                    None => None,
-                },
+                lp.rename.as_ref().map(|rn| parse_lockpack_rename(rn)),
             )
         })
         .collect();
@@ -682,7 +763,7 @@ fn sync_deps(
     let installed: Vec<(String, Version)> = installed
         .iter()
         // Don't standardize name here; see note below in to_uninstall.
-        .map(|t| (t.0.clone(), t.1))
+        .map(|t| (t.0.clone(), t.1.clone()))
         .collect();
 
     // Filter by not-already-installed.
@@ -710,7 +791,7 @@ fn sync_deps(
         .filter(|inst| {
             // Don't standardize the name here; we need original capitalization to uninstall
             // metadata etc.
-            let inst = (inst.0.clone(), inst.1);
+            let inst = (inst.0.clone(), inst.1.clone());
             let mut contains = false;
             // We can't just use the contains method, due to needing compare_names().
             for pack in &packages_only {
@@ -737,8 +818,8 @@ fn sync_deps(
     }
 
     for ((name, version), rename) in &to_install {
-        let data = dep_resolution::get_warehouse_release(name, version)
-            .expect("Problem getting warehouse data");
+        let data =
+            res::get_warehouse_release(name, version).expect("Problem getting warehouse data");
 
         let (best_release, package_type) =
             util::find_best_release(&data, name, version, os, python_vers);
@@ -746,29 +827,12 @@ fn sync_deps(
         // Powershell  doesn't like emojis
         // todo format literal issues, so repeating this whole statement.
         #[cfg(target_os = "windows")]
-        println!(
-            "Installing {}{}{} {} ...",
-            Colored::Fg(Color::Cyan),
-            &name,
-            Colored::Fg(Color::Reset),
-            &version
-        );
+        util::print_color_(&format!("Installing {}", &name), Color::Cyan);
         #[cfg(target_os = "linux")]
-        println!(
-            "⬇ Installing {}{}{} {} ...",
-            Colored::Fg(Color::Cyan),
-            &name,
-            Colored::Fg(Color::Reset),
-            &version
-        );
+        util::print_color_(&format!("⬇ Installing {}", &name), Color::Cyan);
         #[cfg(target_os = "macos")]
-        println!(
-            "⬇ Installing {}{}{} {} ...",
-            Colored::Fg(Color::Cyan),
-            &name,
-            Colored::Fg(Color::Reset),
-            &version
-        );
+        util::print_color_(&format!("⬇ Installing {}", &name), Color::Cyan);
+        println!(" {} ...", &version.to_string_color());
 
         if install::download_and_install_package(
             name,
@@ -811,7 +875,7 @@ fn sync_deps(
             install::rename_metadata(
                 &paths
                     .lib
-                    .join(&format!("{}-{}.dist-info", name, version.to_string2())),
+                    .join(&format!("{}-{}.dist-info", name, version.to_string())),
                 name,
                 new,
             );
@@ -916,22 +980,20 @@ fn find_deps_from_script(file_path: &Path) -> Vec<String> {
     let re = Regex::new(r"^__requires__\s*=\s*\[(.*?)\]$").unwrap();
 
     let mut result = vec![];
-    for line in BufReader::new(f).lines() {
-        if let Ok(l) = line {
-            if let Some(c) = re.captures(&l) {
-                let deps_list = c.get(1).unwrap().as_str().to_owned();
-                let deps: Vec<&str> = deps_list.split(',').collect();
-                result = deps
-                    .into_iter()
-                    .map(|d| {
-                        d.to_owned()
-                            .replace(" ", "")
-                            .replace("\"", "")
-                            .replace("'", "")
-                    })
-                    .filter(|d| !d.is_empty())
-                    .collect();
-            }
+    for line in BufReader::new(f).lines().flatten() {
+        if let Some(c) = re.captures(&line) {
+            let deps_list = c.get(1).unwrap().as_str().to_owned();
+            let deps: Vec<&str> = deps_list.split(',').collect();
+            result = deps
+                .into_iter()
+                .map(|d| {
+                    d.to_owned()
+                        .replace(" ", "")
+                        .replace("\"", "")
+                        .replace("'", "")
+                })
+                .filter(|d| !d.is_empty())
+                .collect();
         }
     }
 
@@ -946,21 +1008,23 @@ fn run_script(
     script_env_path: &Path,
     dep_cache_path: &Path,
     os: util::Os,
-    args: &mut Vec<String>,
+    args: &[String],
     pyflow_dir: &Path,
 ) {
+    #[cfg(debug_assertions)]
+    eprintln!("Run script args: {:?}", args);
     // todo: DRY with run_cli_tool and subcommand::Install
     let filename = if let Some(a) = args.get(0) {
         a.clone()
     } else {
-        abort("`run` must be followed by the script to run, eg `pyflow script myscript.py`");
+        abort("`script` must be followed by the script to run, eg `pyflow script myscript.py`");
         unreachable!()
     };
 
     // todo: Consider a metadata file, but for now, we'll use folders
     //    let scripts_data_path = script_env_path.join("scripts.toml");
 
-    let env_path = script_env_path.join(&filename);
+    let env_path = util::canon_join(script_env_path, &filename);
     if !env_path.exists() {
         fs::create_dir_all(&env_path).expect("Problem creating environment for the script");
     }
@@ -981,7 +1045,7 @@ fn run_script(
 
         fs::File::create(&py_vers_path)
             .expect("Problem creating a file to store the Python version for this script");
-        fs::write(py_vers_path, &cfg_vers.to_string2())
+        fs::write(py_vers_path, &cfg_vers.to_string())
             .expect("Problem writing Python version file.");
     }
 
@@ -1023,8 +1087,15 @@ fn run_script(
                     Version::from_str(&lp.version).expect("Problem getting version"),
                 )
             } else {
-                let vinfo = dep_resolution::get_version_info(name)
-                    .unwrap_or_else(|_| panic!("Problem getting version info for {}", &name));
+                let vinfo = res::get_version_info(
+                    name,
+                    Some(Req::new_with_extras(
+                        name.to_string(),
+                        vec![Constraint::new_any()],
+                        Extras::new_py(Constraint::new(ReqType::Exact, py_vers.clone())),
+                    )),
+                )
+                .unwrap_or_else(|_| panic!("Problem getting version info for {}", &name));
                 (vinfo.0, vinfo.1)
             };
 
@@ -1050,6 +1121,7 @@ fn run_script(
 
 /// Function used by `Install` and `Uninstall` subcommands to syn dependencies with
 /// the config and lock files.
+#[allow(clippy::too_many_arguments)]
 fn sync(
     paths: &util::Paths,
     lockpacks: &[LockPackage],
@@ -1107,7 +1179,7 @@ fn sync(
         combined_reqs.push(dev_req);
     }
 
-    let resolved = if let Ok(r) = dep_resolution::resolve(&combined_reqs, &locked, os, py_vers) {
+    let resolved = if let Ok(r) = res::resolve(&combined_reqs, &locked, os, py_vers) {
         r
     } else {
         abort("Problem resolving dependencies");
@@ -1119,7 +1191,7 @@ fn sync(
     let mut updated_lock_packs = vec![];
 
     for package in &resolved {
-        let dummy_constraints = vec![Constraint::new(ReqType::Exact, package.version)];
+        let dummy_constraints = vec![Constraint::new(ReqType::Exact, package.version.clone())];
         if already_locked(&locked, &package.name, &dummy_constraints) {
             let existing: Vec<&LockPackage> = lockpacks
                 .iter()
@@ -1137,10 +1209,7 @@ fn sync(
             .map(|(_, name, version)| {
                 format!(
                     "{} {} pypi+https://pypi.org/pypi/{}/{}/json",
-                    name,
-                    version.to_string2(),
-                    name,
-                    version.to_string2(),
+                    name, version, name, version,
                 )
             })
             .collect();
@@ -1269,37 +1338,44 @@ fn main() {
     #[cfg(target_os = "macos")]
     let os = Os::Mac;
 
-    // Handle commands that don't involve operating out of a project before one that do, with setup
-    // code in-between.
     let opt = Opt::from_args();
-    let subcmd = match opt.subcmds {
-        Some(sc) => sc,
-        None => {
-            // This branch runs when none of the specified subcommands are used
-            if opt.script.is_empty() || opt.script[0].ends_with("py") {
-                // Nothing's specified, eg `pyflow`, or a script is specified; run `python`.
-                SubCommand::Python { args: opt.script }
+    #[cfg(debug_assertions)]
+    eprintln!("opts {:?}", opt);
+    // Handle color option
+    let choice = match opt.color.unwrap_or_else(|| String::from("auto")).as_str() {
+        "always" => ColorChoice::Always,
+        "ansi" => ColorChoice::AlwaysAnsi,
+        "auto" => {
+            if atty::is(atty::Stream::Stdout) {
+                ColorChoice::Auto
             } else {
-                //                println!("ARGS: {:?}", &opt.script);
-                if opt.script[0] == "m" {
-                    //                    println!("HMM");
-                }
-                // A command is specified, eg `pyflow black`
-                SubCommand::Run { args: opt.script }
+                ColorChoice::Never
             }
         }
+        _ => ColorChoice::Never,
+    };
+
+    CliConfig {
+        color_choice: choice,
+    }
+    .make_current();
+
+    // Handle commands that don't involve operating out of a project before one that do, with setup
+    // code in-between.
+    let subcmd = opt.subcmds;
+
+    let extcmd = if let SubCommand::External(ref x) = subcmd {
+        Some(ExternalCommand::from_opt(x.to_owned()))
+    } else {
+        None
     };
 
     // Run this before parsing the config.
-    if let SubCommand::Script { mut args } = subcmd {
-        run_script(
-            &script_env_path,
-            &dep_cache_path,
-            os,
-            &mut args,
-            &pyflow_path,
-        );
-        return;
+    if let Some(x) = extcmd.clone() {
+        if let ExternalSubcommands::Script = x.cmd {
+            run_script(&script_env_path, &dep_cache_path, os, &x.args, &pyflow_path);
+            return;
+        }
     }
 
     if let SubCommand::New { name } = subcmd {
@@ -1360,7 +1436,7 @@ fn main() {
                 "To get started, run `pyflow new projname` to create a project folder, or \
             `pyflow init` to start a project in this folder. For a list of what you can do, run \
             `pyflow help`.",
-                Color::DarkCyan,
+                Color::Cyan, // Dark
             );
             return;
         }
@@ -1392,14 +1468,11 @@ fn main() {
         }
         SubCommand::Switch { version } => {
             // Updates `pyproject.toml` with a new python version
-            let specified = util::fallible_v_parse(&version);
-            cfg.py_version = Some(specified);
+            let specified = util::fallible_v_parse(&version.clone());
+            cfg.py_version = Some(specified.clone());
             files::change_py_vers(&PathBuf::from(&cfg_path), &specified);
             util::print_color(
-                &format!(
-                    "Switched to Python version {}.{}",
-                    &specified.major, &specified.minor
-                ),
+                &format!("Switched to Python version {}", specified.to_string()),
                 Color::Green,
             );
             // Don't return; now that we've changed the cfg version, let's run the normal flow.
@@ -1423,7 +1496,7 @@ fn main() {
         _ => (),
     }
 
-    let cfg_vers = if let Some(v) = cfg.py_version {
+    let cfg_vers = if let Some(v) = cfg.py_version.clone() {
         v
     } else {
         let specified = util::prompt_py_vers();
@@ -1577,6 +1650,7 @@ fn main() {
 
             // Filter reqs here instead of re-reading the config from file.
             let updated_reqs: Vec<Req> = cfg
+                .clone()
                 .reqs
                 .into_iter()
                 .filter(|req| !removed_reqs.contains(&req.name))
@@ -1595,11 +1669,6 @@ fn main() {
             util::print_color("Uninstall complete", Color::Green);
         }
 
-        SubCommand::Python { args } => {
-            if commands::run_python(&paths.bin, &pythonpath, &args).is_err() {
-                abort("Problem running Python");
-            }
-        }
         SubCommand::Package { extras } => {
             sync(
                 &paths,
@@ -1615,9 +1684,7 @@ fn main() {
             build::build(&lockpacks, &paths, &cfg, &extras)
         }
         SubCommand::Publish {} => build::publish(&paths.bin, &cfg),
-        SubCommand::Run { args } => {
-            run_cli_tool(&paths.lib, &paths.bin, &vers_path, &cfg, args);
-        }
+
         //        SubCommand::M { args } => {
         //            run_cli_tool(&paths.lib, &paths.bin, &vers_path, &cfg, args);
         //        }
@@ -1630,6 +1697,25 @@ fn main() {
                 .collect::<Vec<Req>>(),
         ),
         _ => (),
+    }
+
+    if let Some(x) = extcmd {
+        match x.cmd {
+            ExternalSubcommands::Python => {
+                if commands::run_python(&paths.bin, &pythonpath, &x.args).is_err() {
+                    abort("Problem running Python");
+                }
+            }
+            ExternalSubcommands::Run => {
+                run_cli_tool(&paths.lib, &paths.bin, &vers_path, &cfg, x.args);
+            }
+            x => {
+                abort(&format!(
+                    "Sub command {:?} should have been handled already",
+                    x
+                ));
+            }
+        }
     }
 }
 

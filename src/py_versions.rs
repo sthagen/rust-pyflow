@@ -3,10 +3,10 @@
 use crate::commands;
 use crate::dep_types::Version;
 use crate::{install, util};
-use crossterm::Color;
 use std::error::Error;
 #[allow(unused_imports)]
 use std::{fmt, fs, io, path::Path, path::PathBuf};
+use termcolor::Color;
 
 /// Only versions we've built and hosted
 #[derive(Clone, Copy, Debug)]
@@ -37,11 +37,11 @@ impl From<(Version, Os)> for PyVers {
     fn from(v_o: (Version, Os)) -> Self {
         let unsupported = "Unsupported python version requested; only Python ≥ 3.4 is supported. \
         to fix this, edit the `py_version` line of `pyproject.toml`, or run `pyflow switch 3.7`";
-        if v_o.0.major != 3 {
+        if v_o.0.major != Some(3) {
             util::abort(unsupported);
             unreachable!()
         }
-        match v_o.0.minor {
+        match v_o.0.minor.unwrap_or(0) {
             4 => match v_o.1 {
                 Os::Windows => {
                     abort_helper("3.4", "Windows");
@@ -159,6 +159,7 @@ impl PyVers {
 /// todo: How cross-compat are these? Eg work across diff versions of Ubuntu?
 /// todo: 32-bit
 #[derive(Clone, Copy, Debug)]
+#[allow(dead_code)]
 enum Os {
     // Don't confuse with crate::Os
     Ubuntu, // Builds on Ubuntu 18.04 work on Ubuntu 19.04, Debian, Arch, and Kali
@@ -234,7 +235,7 @@ fn download(py_install_path: &Path, version: &Version) {
     }
 
     // Match up our version to the closest match (major+minor will match) we've built.
-    let vers_to_dl2: PyVers = (*version, os).into();
+    let vers_to_dl2: PyVers = (version.clone(), os).into();
     let vers_to_dl = vers_to_dl2.to_string();
 
     let url = format!(
@@ -354,16 +355,14 @@ fn find_installed_versions(pyflow_dir: &Path) -> Vec<Version> {
     for entry in pyflow_dir
         .read_dir()
         .expect("Can't open python installs path")
+        .flatten()
     {
-        if let Ok(entry) = entry {
-            if !entry.path().is_dir() {
-                continue;
-            }
+        if !entry.path().is_dir() {
+            continue;
+        }
 
-            if let Some(v) = commands::find_py_version(entry.path().join(py_name).to_str().unwrap())
-            {
-                result.push(v);
-            }
+        if let Some(v) = commands::find_py_version(entry.path().join(py_name).to_str().unwrap()) {
+            result.push(v);
         }
     }
     result
@@ -408,9 +407,9 @@ pub fn create_venv(
     let installed_versions = find_installed_versions(pyflow_dir);
     for iv in &installed_versions {
         if iv.major == cfg_v.major && iv.minor == cfg_v.minor {
-            let folder_name = format!("python-{}", iv.to_string2());
+            let folder_name = format!("python-{}", iv.to_string());
             alias_path = Some(pyflow_dir.join(folder_name).join(&py_name));
-            py_ver = Some(*iv);
+            py_ver = Some(iv.clone());
             break;
         }
     }
@@ -447,7 +446,7 @@ pub fn create_venv(
         // Download and install the appropriate Python binary, if we can't find either a
         // custom install, or on the Path.
         download(pyflow_dir, cfg_v);
-        let py_ver2: PyVers = (*cfg_v, os).into();
+        let py_ver2: PyVers = (cfg_v.clone(), os).into();
         py_ver = Some(py_ver2.to_vers());
 
         let folder_name = format!("python-{}", py_ver2.to_string());
@@ -457,7 +456,7 @@ pub fn create_venv(
         // and we're using its `python`.
         #[cfg(target_os = "linux")]
         {
-            match py_ver.unwrap().minor {
+            match py_ver.clone().unwrap().minor.unwrap_or(0) {
                 12 => py_name += ".12",
                 11 => py_name += ".11",
                 10 => py_name += ".10",
@@ -476,7 +475,7 @@ pub fn create_venv(
 
     let py_ver = py_ver.expect("missing Python version");
 
-    let vers_path = pypackages_dir.join(format!("{}.{}", py_ver.major, py_ver.minor));
+    let vers_path = pypackages_dir.join(py_ver.to_string_med());
 
     let lib_path = vers_path.join("lib");
 
@@ -519,11 +518,9 @@ pub fn create_venv(
     #[cfg(target_os = "windows")]
     let venv_lib_path = "Lib";
     #[cfg(target_os = "linux")]
-    let venv_lib_path =
-        PathBuf::from(lib).join(&format!("python{}.{}", py_ver.major, py_ver.minor));
+    let venv_lib_path = PathBuf::from(lib).join(&format!("python{}", py_ver.to_string_med()));
     #[cfg(target_os = "macos")]
-    let venv_lib_path =
-        PathBuf::from(lib).join(&format!("python{}.{}", py_ver.major, py_ver.minor));
+    let venv_lib_path = PathBuf::from(lib).join(&format!("python{}", py_ver.to_string_med()));
 
     let paths = util::Paths {
         bin: bin_path.clone(),

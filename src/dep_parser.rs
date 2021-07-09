@@ -1,11 +1,11 @@
 use std::str::FromStr;
 
-use nom::branch::alt;
-use nom::bytes::complete::{tag, take};
+use nom::bytes::complete::{tag, take, take_till};
 use nom::character::complete::{digit1, space0, space1};
 use nom::combinator::{flat_map, map, map_parser, map_res, opt, value};
 use nom::multi::separated_list;
 use nom::sequence::{delimited, preceded, separated_pair, tuple};
+use nom::{branch::alt, character::is_alphabetic};
 use nom::{AsChar, IResult, InputTakeAtPosition};
 
 use crate::dep_types::{Constraint, Extras, Req, ReqType, Version, VersionModifier};
@@ -80,6 +80,9 @@ pub fn parse_wh_py_vers(input: &str) -> IResult<&str, Vec<Constraint>> {
         map(tag("any"), |_| {
             vec![Constraint::new(ReqType::Gte, Version::new(2, 0, 0))]
         }),
+        map(tag("source"), |_| {
+            vec![Constraint::new(ReqType::Gte, Version::new(2, 0, 0))]
+        }),
         map(parse_version, |v| vec![Constraint::new(ReqType::Caret, v)]),
         separated_list(tag("."), parse_wh_py_ver),
     ))(input)
@@ -91,13 +94,15 @@ fn parse_wh_py_ver(input: &str) -> IResult<&str, Constraint> {
             alt((tag("cp"), tag("py"), tag("pp"))),
             alt((tag("2"), tag("3"), tag("4"))),
             opt(map_parser(take(1u8), digit1)),
+            opt(digit1),
         )),
-        |(_, major, minor): (_, &str, Option<&str>)| {
+        |(_, major, minor, patch): (_, &str, Option<&str>, Option<&str>)| {
             let major: u32 = major.parse().unwrap();
+            let patch = patch.map(|p| p.parse().unwrap());
             match minor {
                 Some(mi) => Constraint::new(
                     ReqType::Exact,
-                    Version::new_short(major, mi.parse().unwrap()),
+                    Version::new_opt(Some(major), Some(mi.parse().unwrap()), patch),
                 ),
                 None => {
                     if major == 2 {
@@ -212,10 +217,33 @@ pub fn parse_version(input: &str) -> IResult<&str, Version> {
         opt(preceded(tag("."), parse_digit_or_wildcard)),
     ))(input)?;
     let (remain, modifire) = parse_modifier(remain)?;
-
-    let mut version = Version::new(major, minor.unwrap_or(0), patch.unwrap_or(0));
+    let mut version = Version::new_opt(Some(major), minor, patch);
     version.extra_num = extra_num;
     version.modifier = modifire;
+    // check if u32::MAX in any version. (marker for `*`). then set that field
+    // and any subsequent fields to `None`
+    version.star = vec![Some(major), minor, patch, extra_num].contains(&Some(u32::MAX));
+    if version.star {
+        if version.major == Some(u32::MAX) {
+            version.major = None;
+            version.minor = None;
+            version.patch = None;
+            version.extra_num = None;
+            version.modifier = None;
+        } else if version.minor == Some(u32::MAX) {
+            version.minor = None;
+            version.patch = None;
+            version.extra_num = None;
+            version.modifier = None;
+        } else if version.patch == Some(u32::MAX) {
+            version.patch = None;
+            version.extra_num = None;
+            version.modifier = None;
+        } else if version.extra_num == Some(u32::MAX) {
+            version.extra_num = None;
+            version.modifier = None;
+        }
+    }
 
     Ok((remain, version))
 }
@@ -251,9 +279,10 @@ fn is_package_char(c: char) -> bool {
 }
 
 fn parse_digit_or_wildcard(input: &str) -> IResult<&str, u32> {
-    map(alt((digit1, value("0", tag("*")))), |digit: &str| {
-        digit.parse().unwrap()
-    })(input)
+    map(
+        alt((digit1, value("4294967295", tag("*")))),
+        |digit: &str| digit.parse().unwrap(),
+    )(input)
 }
 
 fn parse_modifier(input: &str) -> IResult<&str, Option<(VersionModifier, u32)>> {
@@ -264,16 +293,13 @@ fn parse_modifier(input: &str) -> IResult<&str, Option<(VersionModifier, u32)>> 
 }
 
 fn parse_modifier_version(input: &str) -> IResult<&str, VersionModifier> {
-    map(
-        alt((tag("a"), tag("b"), tag("rc"), tag("dep"))),
-        |x| match x {
-            "a" => VersionModifier::Alpha,
-            "b" => VersionModifier::Beta,
-            "rc" => VersionModifier::ReleaseCandidate,
-            "dep" => VersionModifier::Dep,
-            _ => panic!("not execute this code"),
-        },
-    )(input)
+    map(take_till(|c| !is_alphabetic(c as u8)), |x| match x {
+        "a" => VersionModifier::Alpha,
+        "b" => VersionModifier::Beta,
+        "rc" => VersionModifier::ReleaseCandidate,
+        "dep" => VersionModifier::Dep,
+        x => VersionModifier::Other(x.to_string()),
+    })(input)
 }
 
 #[cfg(test)]
@@ -291,7 +317,7 @@ mod tests {
         case("*", Ok(("", Constraint::new(ReqType::Gte, Version::new(0, 0, 0))))),
         case("==1.9.2", Ok(("", Constraint::new(ReqType::Exact, Version::new(1, 9, 2))))),
         case("1.9.2", Ok(("", Constraint::new(ReqType::Exact, Version::new(1, 9, 2))))),
-        case("~=1.9.2", Ok(("", Constraint::new(ReqType::Tilde, Version::new(1, 9, 2))))),
+        case("~=1.9.2", Ok(("", Constraint::new(ReqType::TildeEq, Version::new(1, 9, 2))))),
     )]
     fn test_parse_constraint(input: &str, expected: IResult<&str, Constraint>) {
         assert_eq!(parse_constraint(input), expected);
@@ -299,67 +325,85 @@ mod tests {
 
     #[rstest(input, expected,
         case("3.12.5", Ok(("", Version {
-            major: 3,
-            minor: 12,
-            patch: 5,
+            major: Some(3),
+            minor: Some(12),
+            patch: Some(5),
             extra_num: None,
             modifier: None,
+            star: false,
         }))),
         case("0.1.0", Ok(("", Version {
-            major: 0,
-            minor: 1,
-            patch: 0,
+            major: Some(0),
+            minor: Some(1),
+            patch: Some(0),
             extra_num: None,
             modifier: None,
+            star: false,
         }))),
         case("3.7", Ok(("", Version {
-            major: 3,
-            minor: 7,
-            patch: 0,
+            major: Some(3),
+            minor: Some(7),
+            patch: Some(0),
             extra_num: None,
             modifier: None,
+            star: false,
         }))),
         case("1", Ok(("", Version {
-            major: 1,
-            minor: 0,
-            patch: 0,
+            major: Some(1),
+            minor: Some(0),
+            patch: Some(0),
             extra_num: None,
             modifier: None,
+            star: false,
         }))),
         case("3.2.*", Ok(("", Version {
-            major: 3,
-            minor: 2,
-            patch: 0,
+            major: Some(3),
+            minor: Some(2),
+            patch: None,
             extra_num: None,
             modifier: None,
+            star: true,
         }))),
         case("1.*", Ok(("", Version {
-            major: 1,
-            minor: 0,
-            patch: 0,
+            major: Some(1),
+            minor: None,
+            patch: None,
             extra_num: None,
             modifier: None,
+            star: true,
         }))),
         case("1.*.*", Ok(("", Version {
-            major: 1,
-            minor: 0,
-            patch: 0,
+            major: Some(1),
+            minor: None,
+            patch: None,
             extra_num: None,
             modifier: None,
+            star: true,
         }))),
         case("19.3", Ok(("", Version {
-            major: 19,
-            minor: 3,
-            patch: 0,
+            major: Some(19),
+            minor: Some(3),
+            patch: Some(0),
             extra_num: None,
             modifier: None,
+            star: false,
         }))),
         case("19.3b0", Ok(("", Version {
-            major: 19,
-            minor: 3,
-            patch: 0,
-            extra_num: None,
-            modifier: Some((VersionModifier::Beta, 0)),
+                 major: Some(19),
+                 minor: Some(3),
+                 patch: Some(0),
+                 extra_num: None,
+                 modifier: Some((VersionModifier::Beta, 0)),
+                 star: false,
+        }))),
+        // This package version showed up in boltons history
+        case("0.4.3.dev0", Ok(("", Version {
+                 major: Some(0),
+                 minor: Some(4),
+                 patch: Some(3),
+                 extra_num: None,
+                 modifier: Some((VersionModifier::Other("dev".to_string()), 0)),
+                 star: false,
         }))),
     )]
     fn test_parse_version(input: &str, expected: IResult<&str, Version>) {
@@ -424,8 +468,22 @@ mod tests {
     }
 
     #[rstest(input, expected,
-        case("saturn = \">=0.3.4\"", Ok(("", Req::new("saturn".to_string(), vec![Constraint::new(ReqType::Gte, Version::new(0, 3, 4))])))),
-        case("saturn", Ok(("", Req::new("saturn".to_string(), vec![])))),
+             case::gte("saturn = \">=0.3.4\"", Ok(("", Req::new(
+                 "saturn".to_string(),
+                 vec![Constraint::new(ReqType::Gte, Version::new(0, 3, 4))])))),
+             case::no_version("saturn", Ok(("", Req::new("saturn".to_string(), vec![])))),
+             case::star_patch("saturn = \"0.3.*\"", Ok(("", Req::new(
+                 "saturn".to_string(),
+                 vec![
+                     Constraint::new(ReqType::Exact, Version::new_star(Some(0), Some(3), None, true))
+                 ]
+             )))),
+             case::star_extra_num("saturn = \"0.3.4.*\"", Ok(("", Req::new(
+                 "saturn".to_string(),
+                 vec![
+                     Constraint::new(ReqType::Exact, Version::new_star(Some(0), Some(3), Some(4), true))
+                 ]
+             ))))
     )]
     fn test_parse_req(input: &str, expected: IResult<&str, Req>) {
         assert_eq!(parse_req(input), expected);

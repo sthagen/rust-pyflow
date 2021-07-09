@@ -1,11 +1,11 @@
 use crate::util::print_color;
 use crate::{commands, dep_types::Version, util};
-use crossterm::{Color, Colored};
 use flate2::read::GzDecoder;
 use regex::Regex;
 use ring::digest;
 use std::{fs, io, io::BufRead, path::Path, process::Command};
 use tar::Archive;
+use termcolor::Color;
 
 #[derive(Copy, Clone, Debug)]
 pub enum PackageType {
@@ -99,9 +99,9 @@ pub fn setup_scripts(name: &str, version: &Version, lib_path: &Path, entry_pt_pa
     let mut dist_info_path = lib_path.join(format!("{}-{}.dist-info", name, version.to_string()));
     // If we can't find the dist_info path, it may be due to it not using a full 3-digit semver format.
     // todo: Dry from dep_resolution, release check.
-    if !dist_info_path.exists() && version.patch == 0 {
+    if !dist_info_path.exists() && (version.patch == Some(0) || version.patch == None) {
         dist_info_path = lib_path.join(format!("{}-{}.dist-info", name, version.to_string_med()));
-        if !dist_info_path.exists() && version.minor == 0 {
+        if !dist_info_path.exists() && (version.minor == Some(0) || version.minor == None) {
             dist_info_path =
                 lib_path.join(format!("{}-{}.dist-info", name, version.to_string_short()));
         }
@@ -109,20 +109,18 @@ pub fn setup_scripts(name: &str, version: &Version, lib_path: &Path, entry_pt_pa
 
     if let Ok(ep_file) = fs::File::open(&dist_info_path.join("entry_points.txt")) {
         let mut in_scripts_section = false;
-        for line in io::BufReader::new(ep_file).lines() {
-            if let Ok(l) = line {
-                if l.contains("[console_scripts]") {
-                    in_scripts_section = true;
-                    continue;
-                }
-                if l.starts_with('[') {
-                    // no longer in scripts section.
-                    break;
-                }
-                if in_scripts_section && !l.is_empty() {
-                    // Remove potential leading spaces; have seen indents included.
-                    scripts.push(l.clone().replace(" ", ""));
-                }
+        for line in io::BufReader::new(ep_file).lines().flatten() {
+            if line.contains("[console_scripts]") {
+                in_scripts_section = true;
+                continue;
+            }
+            if line.starts_with('[') {
+                // no longer in scripts section.
+                break;
+            }
+            if in_scripts_section && !line.is_empty() {
+                // Remove potential leading spaces; have seen indents included.
+                scripts.push(line.clone().replace(" ", ""));
             }
         }
     } // else: Probably no scripts.
@@ -162,6 +160,7 @@ pub fn setup_scripts(name: &str, version: &Version, lib_path: &Path, entry_pt_pa
 
 /// Download and install a package. For wheels, we can just extract the contents into
 /// the lib folder.  For source dists, make a wheel first.
+#[allow(clippy::too_many_arguments)]
 pub fn download_and_install_package(
     name: &str,
     version: &Version,
@@ -173,10 +172,10 @@ pub fn download_and_install_package(
     rename: &Option<(u32, String)>,
 ) -> Result<(), reqwest::Error> {
     if !paths.lib.exists() {
-        fs::create_dir(&paths.lib).expect("Problem creating lib directory");
+        fs::create_dir_all(&paths.lib).expect("Problem creating lib directory");
     }
     if !paths.cache.exists() {
-        fs::create_dir(&paths.cache).expect("Problem creating cache directory");
+        fs::create_dir_all(&paths.cache).expect("Problem creating cache directory");
     }
     let archive_path = paths.cache.join(filename);
 
@@ -228,10 +227,9 @@ pub fn download_and_install_package(
     // We must re-open the file after computing the hash.
     let archive_file = util::open_archive(&archive_path);
 
-    let rename = match rename.as_ref() {
-        Some((_, new)) => Some((name.to_owned(), new.to_owned())),
-        None => None,
-    };
+    let rename = rename
+        .as_ref()
+        .map(|(_, new)| (name.to_owned(), new.to_owned()));
 
     match package_type {
         PackageType::Wheel => {
@@ -251,6 +249,10 @@ pub fn download_and_install_package(
             let tar = GzDecoder::new(&archive_file);
             let mut archive = Archive::new(tar);
 
+            // Some python archives don't have file create times set which
+            // breaks wheel builds. Don't preserve mtime fixes this.
+            archive.set_preserve_mtime(false);
+
             // We iterate over and copy entries instead of running `Archive.unpack`, since
             // symlinks in the archive may cause the unpack to break. If this happens, we want
             // to continue unpacking the other files.
@@ -269,7 +271,7 @@ pub fn download_and_install_package(
                                                 f.path(),
                                                 e
                                             ),
-                                            Color::DarkYellow,
+                                            Color::Yellow, // Dark
                                         );
                                         let f_path =
                                             f.path().expect("Problem getting path from archive");
@@ -290,7 +292,7 @@ pub fn download_and_install_package(
                                         {
                                             print_color(
                                                 "Problem creating dummy readme",
-                                                Color::DarkYellow,
+                                                Color::Yellow, // Dark
                                             );
                                         }
                                     }
@@ -488,7 +490,11 @@ pub fn download_and_install_package(
 
 pub fn uninstall(name_ins: &str, vers_ins: &Version, lib_path: &Path) {
     #[cfg(target_os = "windows")]
-    println!("Uninstalling {}: {}...", name_ins, vers_ins.to_string());
+    println!(
+        "Uninstalling {}: {}...",
+        name_ins,
+        vers_ins.to_string_color()
+    );
     #[cfg(target_os = "linux")]
     println!("🗑 Uninstalling {}: {}...", name_ins, vers_ins.to_string());
     #[cfg(target_os = "macos")]
@@ -500,13 +506,13 @@ pub fn uninstall(name_ins: &str, vers_ins: &Version, lib_path: &Path) {
     let mut dist_info_path =
         lib_path.join(format!("{}-{}.dist-info", name_ins, vers_ins.to_string()));
     // todo: DRY
-    if !dist_info_path.exists() && vers_ins.patch == 0 {
+    if !dist_info_path.exists() && (vers_ins.patch == Some(0) || vers_ins.patch == None) {
         dist_info_path = lib_path.join(format!(
             "{}-{}.dist-info",
             name_ins,
             vers_ins.to_string_med()
         ));
-        if !dist_info_path.exists() && vers_ins.minor == 0 {
+        if !dist_info_path.exists() && (vers_ins.minor == Some(0) || vers_ins.minor == None) {
             dist_info_path = lib_path.join(format!(
                 "{}-{}.dist-info",
                 name_ins,
@@ -522,10 +528,8 @@ pub fn uninstall(name_ins: &str, vers_ins: &Version, lib_path: &Path) {
     let folder_names = match fs::File::open(dist_info_path.join("top_level.txt")) {
         Ok(f) => {
             let mut names = vec![];
-            for line in io::BufReader::new(f).lines() {
-                if let Ok(l) = line {
-                    names.push(l);
-                }
+            for line in io::BufReader::new(f).lines().flatten() {
+                names.push(line);
             }
             names
         }
@@ -537,12 +541,10 @@ pub fn uninstall(name_ins: &str, vers_ins: &Version, lib_path: &Path) {
             // Some packages include a .py file directly in the lib directory instead of a folder.
             // Check that if removing the folder fails.
             if fs::remove_file(lib_path.join(&format!("{}.py", folder_name))).is_err() {
-                println!(
-                    "{}Problem uninstalling {} {}",
-                    Colored::Fg(Color::DarkRed),
-                    name_ins,
-                    vers_ins.to_string(),
-                )
+                print_color(
+                    &format!("Problem uninstalling {} {}", name_ins, vers_ins.to_string(),),
+                    Color::Red, // Dark
+                );
             }
         }
     }
@@ -556,12 +558,14 @@ pub fn uninstall(name_ins: &str, vers_ins: &Version, lib_path: &Path) {
     };
 
     if !meta_folder_removed {
-        println!(
-            "{}Problem uninstalling metadata for {}: {}",
-            Colored::Fg(Color::DarkRed),
-            name_ins,
-            vers_ins.to_string(),
-        )
+        print_color(
+            &format!(
+                "Problem uninstalling metadata for {}: {}",
+                name_ins,
+                vers_ins.to_string_color(),
+            ),
+            Color::Red, // Dark
+        );
     }
 
     // Remove the data directory, if it exists.
